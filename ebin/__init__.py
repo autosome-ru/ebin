@@ -29,4 +29,4 @@ from .plots import (plot_marginal_distribution, plot_activity_vs_raw,  # noqa: E
                     plot_gc_vs_abundance, plot_all, raw_mass_center,
                     gc_content, marginal_density)
 
-__version__ = "1.0"
+__version__ = "1.0.1"
