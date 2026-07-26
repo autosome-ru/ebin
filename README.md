@@ -311,6 +311,6 @@ import so JAX does not claim 75% of VRAM.
 
 so `X, T, R, P` are 3D arrays:
 <center>
-<img src="http://data.georgy.top/media/ebin_index_cube.svg" alt="Index cube: n sequences, s replicates, b bins" width="196">
+<img src="http://data.georgy.top/media/ebin_index_cube.png" alt="Index cube: n sequences, s replicates, b bins" width="196">
 </center>
 
