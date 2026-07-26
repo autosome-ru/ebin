@@ -290,3 +290,27 @@ free-`a_n` fit. Memory is dominated by the latent-count grid
 (`a_max · lambda_fix` wide); the likelihood scans over abundance/rate components
 so only one is live at a time. `XLA_PYTHON_CLIENT_PREALLOCATE=false` is set on
 import so JAX does not claim 75% of VRAM.
+
+
+## Parameters
+
+
+| symbol | shape | role | what it is | example (A549) |
+| --- | --- | --- | --- | --- |
+| `X[n,s,b]` | N×S×B | observed | reads counted for sequence n in channel (s,b) | 1686 median total |
+| `T[n,s,b]` | N×S×B | latent | cells of n that landed in bin b — never observed, summed out | ~63 cells |
+| `mu_n`, `sigma_n` | N each | per sequence | the sequence's expression law over cells, in gauge units | σ median 1.46 |
+| `a_n` | N | per sequence | size factor: how many cells n contributes at all. Geometric mean pinned to 1, capped at `a_max` | 1.42 median |
+| `Pi[n,b]` | N×B | derived | bin profile, rows sum to 1. Not free — read off `(mu_n, sigma_n)` and the cuts | — |
+| `q_j` | B−1 | shared | cut points = quantiles of the mixture `G` at `j/B`. Gauge pins `q_1 = −1`, `q_2 = 0` | −1, 0, 0.99 |
+| `lambda_s` | S | fixed | cell level of replicate s. Not identified — rides the `R·lambda` ridge, so held fixed while `R` absorbs the scale | 50 |
+| `R[s,b]` | S×B | per channel | NB size per latent cell: `R·T` is the shape of the read distribution | 12.7 11.4 11.6 20.1 |
+| `P[s,b]` | S×B | per channel | NB probability. Small `P` = a noisier channel at the same depth | .33 .32 .31 .52 |
+| `phi` | 1 | shared | probability a sequence is a structural zero (dropout, never a cell) | 8e−7 |
+| `kappa` | 1 | optional | Gamma shape when `a_n` is integrated out instead of fitted; CV = 1/√κ | 0.9 (variant) |
+
+so `X, T, R, P` are 3D arrays:
+<center>
+<img src="http://data.georgy.top/media/ebin_index_cube.svg" alt="Index cube: n sequences, s replicates, b bins" width="196">
+</center>
+
