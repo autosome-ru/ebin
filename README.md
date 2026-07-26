@@ -227,61 +227,6 @@ coherent with the fitted model. A flat effect location is obtained with
 per-sequence target (for instance the same sequence's consensus across cell
 lines).
 
-## Reproducing the shipped tables
-
-The shipped `activity_zi_full.csv` (30k sequences × 20 cell lines) is the
-default configuration:
-
-```bash
-python -m ebin data.csv -o activity.csv --save-fits fits.pkl
-```
-
-Cell lines come out in the order they appear in the count table, and every field
-is written. The shipped table carried only `activity, activity_sd,
-activity_map, tot` in an explicit cell-line order, so
-
-```bash
-python -m ebin data.csv -o activity.csv \
-    --fields activity,activity_sd,activity_map,tot --groups A549,HepG2,MCF7,...
-```
-
-reproduces that exact layout. The extra columns are additional output, not a
-change to the numbers.
-
-Checked against the shipped table three ways:
-
-* **Readout.** Given the shipped fitted parameters, `readout_table` reproduces
-  `activity`, `activity_sd`, `activity_map` and `tot` to `4e-16` — exact up to
-  CSV round-off.
-* **Objective.** The log-likelihood and its gradient agree **bit for bit** with
-  the original implementation at the same parameter point, for zero inflation
-  and zero truncation, free and Gamma abundance — including the gradient
-  through the implicit cut-point solve.
-* **Full refit.** Most cell lines land on the shipped optimum (`max|Δ|` on
-  activity ≤ 1e-6). A few of the hardest lines do not: the objective is
-  multi-modal there, and the optimizer can settle in a neighbouring basin,
-  which moves individual sequences by up to ~1e-1 (Pearson r ≥ 0.9998 against
-  the shipped column). This is a property of the problem, not of the
-  repackaging — the original code has the same instability on the same lines
-  (re-fitting HCT116 with it lands 13 nats from its own shipped value), and
-  both implementations reproduce those lines when fitted on their own.
-
-The external-library (lib2) target used the same fit with a smaller readout
-grid, selected with `--grid 61x25`.
-
-The Gamma-abundance variant was warm-started from the shipped fits, which is
-what makes it affordable, and used a shorter finishing schedule:
-
-```python
-from ebin import activity_table
-activity_table("data.csv", out="activity_gamma.csv", warm_from="fits.pkl",
-               abundance=False, abundance_prior="gamma", n_abund_nodes=30,
-               max_outer=1, finish_maxiter=2000, finish_rounds=4)
-```
-
-The CLI runs the same variant on the default schedule:
-`--abundance gamma --nodes 30 --warm-from fits.pkl`.
-
 ## Runtime
 
 One cell line of 30k sequences × 4 bins takes ~2–4 min on a GPU (fit + readout)
