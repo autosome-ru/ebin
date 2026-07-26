@@ -7,7 +7,7 @@ likelihood; what is estimated is the sequence's latent expression distribution.
 
 
 
-<img src="http://data.georgy.top/media/ebin_model_layer.png" alt="EBin model"/>
+<img src="http://data.georgy.top/media/ebin_model_layers.png" alt="EBin model"/>
 
 
 ```MPRA 
