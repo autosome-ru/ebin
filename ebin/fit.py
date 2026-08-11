@@ -14,6 +14,14 @@ Regularization (all in the pinned gauge, where the cut spacing is 1):
   profile (t, 0, 0, 1-t), reachable only as sigma -> inf along mu = c*sigma,
   where the Gaussian degenerates into two point masses.  Such objects otherwise
   run to the log-sigma bound.
+* ``sigma_shared``  the hard version of the same prior: ONE effect scale for
+  the whole cell line instead of one per object (an ordered probit with
+  homoskedastic latent).  Note the effect axis has no units -- the likelihood
+  sees only the z-scores (q_j - mu_n)/sigma_n -- so "all sigmas equal to 1" and
+  "all sigmas equal to any other common constant" are the SAME model, reached
+  from each other by the gauge map.  What is fitted is therefore one free
+  scalar, reported in the pinned gauge where the cut spacing is 1; only its
+  RATIO to the cut spacing is identified.
 * ``mu_prior``  Normal prior on the effect means.  sigma_prior bounds the
   effect SPREAD but not its LOCATION, so a single-bin low-count object still
   runs mu_n large and its Pi walks to a simplex vertex (activity exactly 1 or
@@ -29,8 +37,20 @@ profile and becomes an abundance proxy.  Either fit a free a_n
 (``abundance=True``) or integrate it out under a Gamma prior
 (``abundance_prior='gamma'``), which costs one global parameter instead of N and
 propagates the abundance uncertainty into the effect.
+
+Emission mixture (K > 1).  The channel block then holds K sets of (R, P) and the
+data term is the RESPONSIBILITY-WEIGHTED log-likelihood
+
+    sum_n sum_k gamma[n,k] * loglik(n | component k),
+
+with ``gamma`` fixed.  That is the M-step of an EM whose latent component index
+k_n is shared by every cell line, which is why the weights come in from outside
+and are not estimated here (see mixture.py).  The per-object block eta is shared
+across components: a sequence has one effect law and one abundance, and only its
+emission differs.
 """
 
+import pickle
 import time
 from dataclasses import dataclass, field
 
@@ -43,25 +63,34 @@ from scipy.special import ndtri
 from .model import LoglikBuilder, gamma_mixture_rule
 from .initialize import initialize
 from .effects import mixture_quantiles, normal_bin_probs, gauge_normalize
-from .truncation import log_zero_prob, log_zero_prob_abund, log1mexp
+from .truncation import (log_zero_prob, log_zero_prob_abund, log1mexp,
+                         log_zero_prob_components,
+                         log_zero_prob_abund_components)
 
 jax.config.update("jax_enable_x64", True)
 
 _GLOBAL_CYCLE = ["SLSQP", "TNC", "L-BFGS-B"]
 
+# bound on log R in the channel block.  Exported because anything that writes R
+# back into a fit has to respect the SAME bound: a tighter one silently rewrites
+# the fit after its objective was evaluated (see mixture.ridge_step).
+LOG_R_BOUND = 20.0
+
 
 @dataclass
 class FitResult:
-    R: np.ndarray                 # (S, B) emission size
-    P: np.ndarray                 # (S, B) emission probability
+    R: np.ndarray                 # (S, B) emission size       -- (K, S, B) if K > 1
+    P: np.ndarray                 # (S, B) emission probability -- likewise
     mu: np.ndarray                # (N,) effect means      (pinned gauge)
     sigma: np.ndarray             # (N,) effect sds        (pinned gauge)
     cuts: np.ndarray              # (B-1,) shared bin cut points
     Pi: np.ndarray                # (N, B) implied bin profile
-    rates: np.ndarray             # (S, K) latent Poisson rates
-    log_w: np.ndarray             # (S, K) their log weights
+    rates: np.ndarray             # (S, 1) latent Poisson rates (lambda_fix)
+    log_w: np.ndarray             # (S, 1) their log weights
     phi: float                    # structural-zero probability (0 if truncated)
-    loglik: float
+    loglik: float                 # K > 1: the M-step's gamma-weighted data
+                                  # term, not the observed-data log-likelihood
+                                  # (which only exists across all cell lines)
     n_observed: int
     converged: bool
     observed: np.ndarray          # (N,) objects entering the fit
@@ -70,6 +99,32 @@ class FitResult:
     extras: dict = None           # kappa / abundance CV under a Gamma prior
     history: list = field(repr=False, default=None)
     config: dict = field(repr=False, default=None)
+
+
+class StoredFit:
+    """The part of a fit the readout needs, as loaded from disk."""
+
+    def __init__(self, d):
+        self.__dict__.update(d)
+
+
+def light(res):
+    """A ``FitResult`` without the optimizer history: everything the readout
+    reads, plus the fitted per-object effect law and abundance."""
+    return dict(R=res.R, P=res.P, rates=res.rates, log_w=res.log_w,
+                cuts=res.cuts, Pi=res.Pi, mu=res.mu, sigma=res.sigma, a=res.a,
+                observed=res.observed, phi=res.phi, loglik=res.loglik,
+                converged=res.converged, extras=res.extras, config=res.config)
+
+
+def save_fits(path, fits):
+    with open(path, "wb") as f:
+        pickle.dump(fits, f)
+
+
+def load_fits(path):
+    with open(path, "rb") as f:
+        return {g: StoredFit(d) for g, d in pickle.load(f).items()}
 
 
 def _solver_options(method, budget):
@@ -97,32 +152,53 @@ def _res_line(res, scale):
 
 
 class _Globals:
-    """The channel block: theta = [log R (S*B), logit P (S*B), logit phi]."""
+    """The channel block: theta = [log R (K*S*B), logit P (K*S*B), logit phi].
 
-    def __init__(self, S, B, lambda_fix):
-        self.S, self.B, self.lambda_fix = S, B, float(lambda_fix)
-        n = S * B
+    With K = 1 the layout is exactly the single-emission one, so a theta packed
+    here is interchangeable with the pre-mixture code.  phi is NOT per component:
+    a structural zero is a property of the cell line (the sequence never made it
+    into this library), not of how well it amplifies.
+    """
+
+    def __init__(self, S, B, lambda_fix, K=1):
+        self.S, self.B, self.K = S, B, int(K)
+        self.lambda_fix = float(lambda_fix)
+        n = self.K * S * B
         self.idx_R = slice(0, n)
         self.idx_P = slice(n, 2 * n)
         self.idx_phi = 2 * n
         self.n_params = 2 * n + 1
 
+    def _components(self, A, name):
+        """Broadcast an (S, B) emission table over the K components."""
+        A = np.asarray(A, dtype=float)
+        if A.shape == (self.S, self.B):
+            return np.broadcast_to(A, (self.K, self.S, self.B))
+        if A.shape == (self.K, self.S, self.B):
+            return A
+        raise ValueError(f"init.{name} has shape {A.shape}; expected "
+                         f"{(self.S, self.B)} or {(self.K, self.S, self.B)}")
+
     def pack(self, init):
         th = np.zeros(self.n_params)
-        th[self.idx_R] = np.log(np.asarray(init.R)).ravel()
-        Pc = np.clip(np.asarray(init.P), 1e-12, 1 - 1e-12)
+        th[self.idx_R] = np.log(self._components(init.R, "R")).ravel()
+        Pc = np.clip(self._components(init.P, "P"), 1e-12, 1 - 1e-12)
         th[self.idx_P] = np.log(Pc / (1 - Pc)).ravel()
         phi = float(np.clip(init.phi, 1e-6, 0.95))
         th[self.idx_phi] = np.log(phi / (1 - phi))
         return th
 
     def bounds(self):
-        n = self.S * self.B
-        return [(-20.0, 20.0)] * n + [(-25.0, 25.0)] * n + [(-14.0, 3.0)]
+        n = self.K * self.S * self.B
+        return ([(-LOG_R_BOUND, LOG_R_BOUND)] * n + [(-25.0, 25.0)] * n
+                + [(-14.0, 3.0)])
 
     def unpack(self, theta):
-        R = jnp.exp(theta[self.idx_R]).reshape(self.S, self.B)
-        P = jax.nn.sigmoid(theta[self.idx_P]).reshape(self.S, self.B)
+        """(R, P) are (K, S, B); with K = 1 callers index [0] to recover the
+        original (S, B) tables."""
+        shape = (self.K, self.S, self.B)
+        R = jnp.exp(theta[self.idx_R]).reshape(shape)
+        P = jax.nn.sigmoid(theta[self.idx_P]).reshape(shape)
         phi = jax.nn.sigmoid(theta[self.idx_phi])
         rates = jnp.full((self.S,), self.lambda_fix)[:, None]
         return R, P, rates, jnp.zeros((self.S, 1)), phi
@@ -148,7 +224,9 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
                 conditional=False, abundance=True, a_max=15.0,
                 abundance_prior=None, n_abund_nodes=24,
                 kappa_init=None, kappa_bounds=(0.5, 4096.0),
-                sigma_prior=(0.0, 0.5), mu_prior=1.3, mu_center=None,
+                sigma_prior=(0.0, 0.5), sigma_shared=False,
+                mu_prior=1.3, mu_center=None,
+                K=1, gamma=None, a_init=None, eta_init=None,
                 pin_median=0.0, pin_left=-1.0, pin_weight=100.0,
                 pi_floor=1e-12, init=None,
                 max_outer=3, tol=1e-6, global_maxiter=80, eta_maxiter=40,
@@ -167,10 +245,36 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         sizes the latent tau grid; under the Gamma prior it is only the grid
         ceiling, since the far nodes carry negligible weight.
     sigma_prior : (m, s) Normal prior on log sigma_n, or None.
+    sigma_shared : fit ONE effect scale for the whole cell line instead of one
+        per object, so every sequence differs only in its effect location mu_n
+        (a homoskedastic ordered probit; N-1 parameters instead of 2N).  The
+        common value is free, not pinned to 1: the effect axis is defined only
+        up to scale, so a pinned value would be a constraint on the cut
+        spacing, not a choice of units.  ``sigma_prior`` then applies to that
+        single scalar and is effectively inert.
     mu_prior, mu_center : sd and target of the Normal prior on mu_n (None
         disables).  ``mu_center`` may be an (N,) array.
+    K, gamma : number of emission components and the (N, K) responsibilities
+        that weight them.  K = 1 (the default) is the plain single-emission
+        model and ignores ``gamma``.  For K > 1 this is an EM M-step: ``gamma``
+        is FIXED here because the component index is shared across cell lines,
+        so it can only be formed from all of them at once -- see
+        ``mixture.fit_mixture``, which is what should normally be called.
+        Passing no ``gamma`` with K > 1 fits K components with equal weights,
+        which is a mixture with no assignment information and will not
+        separate; it is allowed only as a starting point.
     init : an ``InitResult`` to start from (see ``init_from_fit`` for warm
-        starts); ``None`` runs the per-column ZINB initialization.
+        starts); ``None`` runs the per-column ZINB initialization.  With K > 1
+        its R / P should be (K, S, B) and the components must DIFFER: identical
+        components are a saddle point that the M-step cannot leave.
+    a_init : (N,) starting abundance.  ``init`` does not carry one -- a_n is
+        normally re-derived from the counts -- so this is the way to warm-start
+        it.  Rescaled to geometric mean 1 like the derived start.
+    eta_init : (mu, sigma) to start the effect law from.  ``init`` carries only
+        Pi, from which (mu, sigma) are recovered by a probit least squares whose
+        cumulative probabilities are clipped to [1e-4, 1-1e-4] -- lossy, and it
+        caps a recoverable mu at about 3.7 sigma.  Pass the previous fit's mu
+        and sigma directly when iterating (the EM does).
 
     Defaults reproduce the shipped configuration.
     """
@@ -182,6 +286,20 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
                          "identified")
     target_probs = np.arange(1, B) / B
     mid = (B - 1) // 2
+
+    K = int(K)
+    if K < 1:
+        raise ValueError("K must be >= 1")
+    if gamma is None:
+        gamma = np.full((N, K), 1.0 / K)
+    gamma = np.asarray(gamma, dtype=float)
+    if gamma.shape != (N, K):
+        raise ValueError(f"gamma must have shape {(N, K)}, got {gamma.shape}")
+    if K > 1 and not np.allclose(gamma.sum(1), 1.0, atol=1e-8):
+        # rows that do not sum to 1 silently rescale the data term against the
+        # mu / sigma priors, which are not weighted
+        raise ValueError("gamma rows must sum to 1 (they are responsibilities)")
+    gamma_j = jnp.asarray(gamma)
 
     abund_marg = abundance_prior is not None       # abundance integrated out
     if abund_marg:
@@ -199,7 +317,7 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
             print("[init] fitting per-column ZINBs / quantile transform ...")
         init = initialize(X, mask=mask, lambda_init=lambda_init, verbose=False)
 
-    spec = _Globals(S, B, lambda_fix)
+    spec = _Globals(S, B, lambda_fix, K)
     # with an abundance the latent rate reaches a_max * lambda, so the
     # truncated tau grid must be sized for it
     rate_max = lambda_fix * (a_max if (abundance or abund_marg) else 1.0)
@@ -223,19 +341,29 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
     w_np = kept.astype(np.float64)
     w_np /= w_np.sum()
     w_mix = jnp.asarray(w_np)          # uniform over the objects that count
-    i_kappa = 2 * N                    # eta = [mu, log sigma, log kappa]
+    # eta = [mu (N), log sigma (N or 1), log a (N) | log kappa (1)]
+    n_sig = 1 if sigma_shared else N
+    i_sig = N
+    i_tail = N + n_sig                 # log a block, or the single log kappa
+    i_kappa = i_tail
     if verbose:
-        print(f"[fit] N={N} S={S} B={B} kept={int(kept.sum())} "
+        print(f"[fit] N={N} S={S} B={B} K={K} kept={int(kept.sum())} "
               f"(missing={int((~observed).sum())}, "
               f"zero-dropped={n_zero_dropped}) conditional={conditional} "
               f"abundance={'gamma' if abund_marg else abundance} "
               f"tau_grid={builder.tau_full.shape[0]} "
-              f"sigma_prior={sigma_prior} mu_prior={mu_prior}")
+              f"sigma_prior={sigma_prior} sigma_shared={sigma_shared} "
+              f"mu_prior={mu_prior}")
 
     # --- objective ----------------------------------------------------------
+    def _log_sigma(eta):
+        """(N,) log sigma, broadcast from the single scalar when shared."""
+        ls = eta[i_sig:i_sig + n_sig]
+        return jnp.broadcast_to(ls, (N,)) if sigma_shared else ls
+
     def _pi_and_cuts(eta):
         mu = eta[:N]
-        sig = jnp.exp(eta[N:2 * N])
+        sig = jnp.exp(_log_sigma(eta))
         cuts = mixture_quantiles(mu, sig, w_mix, target_probs)
         return normal_bin_probs(mu, sig, cuts, floor=pi_floor), cuts
 
@@ -244,7 +372,7 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         Pi, cuts = _pi_and_cuts(eta)
         if not abundance:
             return Pi, cuts
-        return jnp.exp(eta[2 * N:3 * N])[:, None] * Pi, cuts
+        return jnp.exp(eta[i_tail:i_tail + N])[:, None] * Pi, cuts
 
     def _abund_rule(eta):
         """(nodes, log weights) of the Gamma(kappa, mean=1) abundance prior."""
@@ -253,6 +381,9 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
     def _data_neg_ll(theta, eta):
         R, P, rates, log_w, phi = spec.unpack(theta)
         M, _ = _rows_and_cuts(eta)
+        if K > 1:
+            return _data_neg_ll_mix(R, P, rates, log_w, phi, M, eta)
+        R, P = R[0], P[0]                        # the single-emission tables
         if abund_marg:
             a_nodes, log_wa = _abund_rule(eta)
             base_lambda = rates[:, 0]                       # (S,)
@@ -276,6 +407,34 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
             total = jnp.sum(builder.object_loglik(R, P, M, rates, log_w, phi))
         return -total * scale
 
+    def _data_neg_ll_mix(R, P, rates, log_w, phi, M, eta):
+        """The EM M-step term sum_n sum_k gamma[n,k] * loglik(n | k).
+
+        A weighted SUM over components, not a logsumexp: the mixture over k is
+        resolved in the E-step, across every cell line at once.
+        """
+        if abund_marg:
+            a_nodes, log_wa = _abund_rule(eta)
+            base_lambda = rates[:, 0]                       # (S,)
+            LL = builder.object_loglik_abund_components(
+                R, P, M, base_lambda, a_nodes, log_wa,
+                0.0 if conditional else phi)                # (N, K)
+            if conditional:
+                lz = jnp.minimum(log_zero_prob_abund_components(
+                    R, P, M, base_lambda, a_nodes, log_wa, builder.mask),
+                    -1e-12)
+                LL = LL - log1mexp(lz)
+        else:
+            LL = builder.object_loglik_components(
+                R, P, M, rates, log_w, 0.0 if conditional else phi)
+            if conditional:
+                lz = jnp.minimum(log_zero_prob_components(
+                    R, P, M, rates, log_w, builder.mask), -1e-12)
+                LL = LL - log1mexp(lz)
+        wll = jnp.sum(gamma_j * LL, axis=1)                 # (N,)
+        total = jnp.sum(jnp.where(kept_j, wll, 0.0))
+        return -total * scale
+
     def _gauge_pen(eta):
         """Soft pin of the effect-axis gauge (and of the a-scale ridge that a_n
         shares with R: only c*a*lambda is identified, so pin the geometric mean
@@ -285,7 +444,7 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         if pin_left is not None and mid > 0:
             pen = pen + pin_weight * jnp.square(cuts[0] - pin_left)
         if abundance:
-            la = eta[2 * N:3 * N]
+            la = eta[i_tail:i_tail + N]
             pen = pen + pin_weight * jnp.square(
                 jnp.sum(jnp.where(kept_j, la, 0.0)) / jnp.sum(kept_j))
         return pen
@@ -293,11 +452,14 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
     def _sigma_pen(eta):
         """-log prior on log sigma, on the same 1/n_obs scale as the data term
         (unlike the gauge pins, its strength relative to the likelihood
-        matters)."""
+        matters).  Shared across objects it is one term against n_obs cells,
+        i.e. inert -- the scale is then set by the data, as it should be."""
         if sigma_prior is None:
             return 0.0
         m_s, s_s = sigma_prior
-        quad = jnp.sum(jnp.where(kept_j, (eta[N:2 * N] - m_s) ** 2, 0.0))
+        ls = eta[i_sig:i_sig + n_sig]
+        quad = (jnp.sum((ls - m_s) ** 2) if sigma_shared else
+                jnp.sum(jnp.where(kept_j, (ls - m_s) ** 2, 0.0)))
         return scale * quad / (2.0 * s_s ** 2)
 
     mu_center_j = (jnp.asarray(mu_center, dtype=jnp.float64)
@@ -328,19 +490,40 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
     theta = spec.pack(init)
     g_bounds = spec.bounds()
 
-    mu0, s0 = _eta_init(init.Pi, target_probs)
+    if eta_init is None:
+        mu0, s0 = _eta_init(init.Pi, target_probs)
+    else:
+        mu0, s0 = (np.asarray(v, dtype=float).copy() for v in eta_init)
+        if mu0.shape != (N,) or s0.shape != (N,):
+            raise ValueError(f"eta_init must be two (N,) arrays, got "
+                             f"{mu0.shape} and {s0.shape}")
+        s0 = np.clip(s0, np.exp(-7.0), np.exp(7.0))
+    if sigma_shared:
+        # the per-object probit start is noisy on low-count objects; the median
+        # is the robust summary of the scale they agree on
+        s0 = np.full(1, np.median(s0[kept]) if kept.any() else np.median(s0))
     eta = np.concatenate([mu0, np.log(s0)])
-    e_bounds = [(-40.0, 40.0)] * N + [(-7.0, 7.0)] * N
+    e_bounds = [(-40.0, 40.0)] * N + [(-7.0, 7.0)] * n_sig
     if abundance:
-        # start a at the object's per-cell total relative to the group mean
-        # (the quantity a exists to explain), geometric mean pinned to 1
-        Xz = np.where(np.asarray(builder.mask), np.nan_to_num(X, nan=0.0), 0.0)
-        cells = np.maximum(np.asarray(builder.mask).sum(axis=(1, 2)), 1)
-        rate_n = Xz.sum(axis=(1, 2)) / cells        # depth-robust per-cell mean
-        ref = np.exp(np.mean(np.log(rate_n[kept] + 1e-6)))
-        la0 = np.log(np.clip(rate_n / max(ref, 1e-12), 1e-3, a_max * 0.9))
+        if a_init is not None:
+            # a supplied by the caller: a warm start, or (under an emission
+            # mixture) the K = 1 abundance with the component's amplification
+            # divided out, so a and the component do not start double-counting
+            # the same depth
+            la0 = np.log(np.clip(np.asarray(a_init, dtype=float),
+                                 1e-3, a_max * 0.9))
+        else:
+            # start a at the object's per-cell total relative to the group mean
+            # (the quantity a exists to explain)
+            Xz = np.where(np.asarray(builder.mask),
+                          np.nan_to_num(X, nan=0.0), 0.0)
+            cells = np.maximum(np.asarray(builder.mask).sum(axis=(1, 2)), 1)
+            rate_n = Xz.sum(axis=(1, 2)) / cells    # depth-robust per-cell mean
+            ref = np.exp(np.mean(np.log(rate_n[kept] + 1e-6)))
+            la0 = np.log(np.clip(rate_n / max(ref, 1e-12), 1e-3, a_max * 0.9))
+        la0 = np.asarray(la0, dtype=float).copy()
         la0[~kept] = 0.0
-        la0 -= la0[kept].mean()
+        la0 -= la0[kept].mean()                     # geometric mean pinned to 1
         eta = np.concatenate([eta, la0])
         e_bounds += [(np.log(1e-4), np.log(a_max))] * N
     if abund_marg:
@@ -362,12 +545,13 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
             print(f"[fit] gamma abundance: nodes={n_abund_nodes} "
                   f"kappa_init={k0:.3g} (CV~{1/np.sqrt(k0):.2f})")
 
-    # start in the pinned gauge
-    mu0, s0, _ = gauge_normalize(eta[:N], np.exp(eta[N:2 * N]),
+    # start in the pinned gauge (the affine map rescales every sigma by the
+    # same k, so a shared scale stays shared)
+    mu0, s0, _ = gauge_normalize(eta[:N], np.exp(eta[i_sig:i_sig + n_sig]),
                                  np.asarray(cuts_fn(jnp.asarray(eta))),
                                  pin_median=pin_median, pin_left=pin_left)
     eta[:N] = mu0
-    eta[N:2 * N] = np.log(s0)
+    eta[i_sig:i_sig + n_sig] = np.log(s0)
 
     history = []
 
@@ -467,9 +651,9 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
     # --- exact gauge normalization + invariance check -----------------------
     # the affine gauge acts on (mu, sigma, cuts) only; a_n and kappa are
     # invariant under it
-    tail = np.asarray(eta[2 * N:], dtype=float)          # log a | log kappa
+    tail = np.asarray(eta[i_tail:], dtype=float)         # log a | log kappa
     mu_hat = np.asarray(eta[:N], dtype=float)
-    sig_hat = np.exp(np.asarray(eta[N:2 * N], dtype=float))
+    sig_hat = np.exp(np.asarray(eta[i_sig:i_sig + n_sig], dtype=float))
     mu_hat, sig_hat, cuts_hat = gauge_normalize(
         mu_hat, sig_hat, np.asarray(cuts_fn(jnp.asarray(eta))),
         pin_median=pin_median, pin_left=pin_left)
@@ -481,7 +665,7 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
             print(f"[warn] gauge normalization moved loglik {ll:.4f} -> "
                   f"{ll_norm:.4f}; keeping the raw optimum")
         mu_hat = np.asarray(eta[:N], dtype=float)
-        sig_hat = np.exp(np.asarray(eta[N:2 * N], dtype=float))
+        sig_hat = np.exp(np.asarray(eta[i_sig:i_sig + n_sig], dtype=float))
         cuts_hat = np.asarray(cuts_fn(jnp.asarray(eta)))
         eta_final = np.asarray(eta, dtype=float)
     else:
@@ -489,14 +673,21 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         eta_final = eta_norm
     record("gauge-normalized", ll)
 
+    # the reported sigma is always (N,), so a shared-scale fit stays a drop-in
+    # everywhere downstream; its rows are simply all equal
+    sig_hat = np.broadcast_to(sig_hat, (N,)).copy()
     a_hat = np.exp(tail[:N]) if abundance else np.ones(N)
     kappa_hat = float(np.exp(eta_final[i_kappa])) if abund_marg else None
     R, P, rates, log_w, phi = spec.unpack(jnp.asarray(theta))
+    # K == 1 reports the plain (S, B) tables, so a single-emission fit stays
+    # interchangeable with everything written before the mixture existed
+    R = np.asarray(R)[0] if K == 1 else np.asarray(R)
+    P = np.asarray(P)[0] if K == 1 else np.asarray(P)
     Pi = np.asarray(normal_bin_probs(jnp.asarray(mu_hat), jnp.asarray(sig_hat),
                                      jnp.asarray(cuts_hat), floor=pi_floor))
 
     return FitResult(
-        R=np.asarray(R), P=np.asarray(P), mu=mu_hat, sigma=sig_hat,
+        R=R, P=P, mu=mu_hat, sigma=sig_hat,
         cuts=cuts_hat, Pi=Pi, rates=np.asarray(rates), log_w=np.asarray(log_w),
         phi=0.0 if conditional else float(phi), loglik=ll, a=a_hat,
         n_observed=n_obs, converged=converged, observed=kept,
@@ -507,6 +698,7 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
                     abundance=abundance, a_max=a_max,
                     abundance_prior=abundance_prior,
                     n_abund_nodes=n_abund_nodes, kappa=kappa_hat,
-                    sigma_prior=sigma_prior, mu_prior=mu_prior,
+                    sigma_prior=sigma_prior, sigma_shared=sigma_shared,
+                    mu_prior=mu_prior, K=K,
                     pin_median=pin_median, pin_left=pin_left,
                     pin_weight=pin_weight, pi_floor=pi_floor))

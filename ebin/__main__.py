@@ -2,7 +2,8 @@
 
 import argparse
 
-from .pipeline import activity_table, write_netcdf, TABLE_FIELDS
+from .pipeline import (activity_table, mixture_activity_table, write_netcdf,
+                       cuts_table)
 
 
 def _parse_args(argv=None):
@@ -30,8 +31,20 @@ def _parse_args(argv=None):
                    help="sd of the prior on the effect location (0 disables)")
     p.add_argument("--sigma-prior", default="0,0.5",
                    help="mean,sd of the prior on log sigma ('none' disables)")
+    p.add_argument("--sigma-shared", action="store_true",
+                   help="one effect scale for the whole cell line instead of "
+                        "one per sequence (homoskedastic ordered probit)")
+    p.add_argument("-K", "--components", type=int, default=1,
+                   help="NB emission components, sharing one component per "
+                        "sequence across all cell lines (1 = no mixture)")
+    p.add_argument("--em-rounds", type=int, default=4,
+                   help="EM rounds for the emission mixture")
     p.add_argument("--grid", default="121x33",
                    help="readout grid, n_mu x n_log_sigma")
+    p.add_argument("--shared-grid", action="store_true",
+                   help="read the posterior off one grid shared by every "
+                        "sequence, instead of re-gridding each on its own "
+                        "posterior; quantizes deep sequences onto single nodes")
     p.add_argument("--fields", help="comma-separated subset of the output "
                                     "fields (default: all of them)")
     p.add_argument("--save-fits", help="pickle the fitted parameters here")
@@ -50,26 +63,37 @@ def main(argv=None):
         tuple(float(v) for v in a.sigma_prior.split(","))
     fit_kw = dict(conditional=a.zero_truncation, a_max=a.a_max,
                   lambda_fix=a.lambda_fix, sigma_prior=sigma_prior,
-                  mu_prior=a.mu_prior or None)
+                  sigma_shared=a.sigma_shared, mu_prior=a.mu_prior or None)
     if a.abundance == "gamma":
         fit_kw.update(abundance=False, abundance_prior="gamma",
                       n_abund_nodes=a.nodes)
-
-    table, results = activity_table(
-        a.data, groups=a.groups.split(",") if a.groups else None,
-        out=a.out, fits_out=a.save_fits, warm_from=a.warm_from,
-        readout=dict(n_mu=n_mu, n_ls=n_ls),
-        fields=tuple(a.fields.split(",")) if a.fields else TABLE_FIELDS,
-        verbose=not a.quiet, **fit_kw)
+    common = dict(groups=a.groups.split(",") if a.groups else None,
+                  out=a.out, fits_out=a.save_fits, warm_from=a.warm_from,
+                  readout=dict(n_mu=n_mu, n_ls=n_ls,
+                               adaptive=not a.shared_grid),
+                  fields=tuple(a.fields.split(",")) if a.fields else None,
+                  verbose=not a.quiet)
+    state = None
+    if a.components > 1:
+        table, results, state = mixture_activity_table(
+            a.data, K=a.components, em_rounds=a.em_rounds, **common, **fit_kw)
+    else:
+        table, results = activity_table(a.data, **common, **fit_kw)
     print(f"[saved] {a.out}  {table.shape[0]} sequences x "
           f"{len(results)} cell lines")
+    cuts_out = a.out.rsplit(".", 1)[0] + "_cuts.csv"
+    cuts_table(results, out=cuts_out)
+    print(f"[saved] {cuts_out}  bin cut points per cell line")
     if a.netcdf:
         write_netcdf(a.netcdf, results, table.index, order=list(results),
-                     attrs=dict(model="EBin", readout=f"{n_mu}x{n_ls} grid"))
+                     attrs=dict(model="EBin",
+                                readout=f"{n_mu}x{n_ls} grid"
+                                + (" (shared)" if a.shared_grid
+                                   else " (per sequence)")))
         print(f"[saved] {a.netcdf}")
     if a.plots:
         from .plots import plot_all
-        plot_all(table, a.data, a.plots, groups=list(results))
+        plot_all(table, a.data, a.plots, groups=list(results), state=state)
 
 
 if __name__ == "__main__":

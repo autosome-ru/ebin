@@ -7,6 +7,9 @@ Gaussian effect law per sequence; see model.py, effects.py and activity.py.
 
     from ebin import activity_table
     table, _ = activity_table("counts.csv", out="activity.csv")
+
+Set ``K`` above 1 for a K-component NB emission mixture whose component is
+chosen once per sequence for the whole dataset -- see mixture.py.
 """
 
 import os
@@ -21,12 +24,16 @@ jax.config.update("jax_enable_x64", True)
 
 from .data import GroupData, read_counts, load_groups, prep  # noqa: E402,F401
 from .initialize import initialize, init_from_fit, InitResult  # noqa: E402,F401
-from .fit import fit_effects, FitResult  # noqa: E402,F401
+from .fit import (fit_effects, FitResult, save_fits,  # noqa: E402,F401
+                  load_fits, StoredFit, light)
 from .activity import posterior_activity  # noqa: E402,F401
-from .pipeline import (activity_table, readout_table, save_fits,  # noqa: E402,F401
-                       load_fits, write_netcdf)
+from .mixture import (fit_mixture, MixtureState, components_table,  # noqa: E402,F401
+                      component_summary, component_loglik, relative_depth,
+                      ridge_step, penalty_nats, save_state, load_state)
+from .pipeline import (activity_table, mixture_activity_table,  # noqa: E402,F401
+                       readout_table, write_netcdf, cuts_table)
 from .plots import (plot_marginal_distribution, plot_activity_vs_raw,  # noqa: E402,F401
-                    plot_gc_vs_abundance, plot_all, raw_mass_center,
-                    gc_content, marginal_density)
+                    plot_gc_vs_abundance, plot_components, plot_all,
+                    raw_mass_center, gc_content, marginal_density)
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"

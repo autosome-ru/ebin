@@ -13,6 +13,20 @@ count values of each channel and gathered back.
 lambda is not identified upward -- it rides the R*lambda ridge, and only
 products like c*Pi*lambda with c = R(1-P)/P are identified -- so it is held
 fixed (``lambda_fix``) and R absorbs the scale.
+
+Emission mixture (K > 1).  The reads-per-cell scale c = R(1-P)/P is an
+amplification efficiency, and in some libraries it is visibly bimodal across
+sequences: the emission then becomes a K-component NB mixture over the SAME
+latent T, with the component chosen once per sequence,
+
+    X[n,s,b] | T[n,s,b], k_n = k ~ NB(R_k[s,b] * T[n,s,b], P_k[s,b]).
+
+The ``*_components`` methods return the (N, K) log-likelihood of every object
+under every component; the mixture over k is resolved outside, because k_n is
+shared across cell lines (see mixture.py).  Note that a component is NOT
+redundant with the abundance a_n: scaling a scales the marginal mean AND
+variance in step (Fano stays 1/P + c), whereas scaling c at a matched mean moves
+the Fano factor, so the two are separately identified.
 """
 
 import numpy as np
@@ -36,6 +50,16 @@ def nb_logpmf(x, r, p):
           + r_safe * jnp.log(p) + x * jnp.log1p(-p))
     degenerate = jnp.where(x == 0, 0.0, _NEG_INF)
     return jnp.where(r > 0, lp, degenerate)
+
+
+def as_components(A):
+    """(S, B) -> (1, S, B); a (K, S, B) emission table passes through.
+
+    ``jnp.atleast_3d`` appends the axis (giving (S, B, 1)), which is the wrong
+    end for a leading component axis.
+    """
+    A = jnp.asarray(A)
+    return A[None] if A.ndim == 2 else A
 
 
 def poisson_trunc_bound(lam_max, tail_eps=1e-10, slack=5):
@@ -116,7 +140,7 @@ class LoglikBuilder:
     def _acc_over_rates(self, s, tbls, Pi, rates_s):
         """(N, K) sum over b of the masked log-marginals, one column per rate.
 
-        Scanned with a rematerialized body so only one rate's (N, T)
+        Scanned with a rematerialized body so only ONE rate's (N, T)
         intermediates are live at a time; a plain loop over k lets XLA allocate
         all K concurrently (tens of GB at N=30000).
         """
@@ -149,9 +173,10 @@ class LoglikBuilder:
         """(N,) per-object log-likelihood.
 
         Pi : (N, B) rows fed to the latent Poisson (a_n * profile when an
-             abundance is fitted).  rates / log_wmix : (S, K) latent rates and
-             their log-weights (K = 1 for the fixed-rate model).  phi : object
-             level zero-inflation probability.
+             abundance is fitted).  rates / log_wmix : (S, M) latent rates and
+             their log-weights (M = 1 for the fixed-rate model; unrelated to
+             the K emission components).  phi : object level zero-inflation
+             probability.
         """
         rates = jnp.atleast_2d(rates)
         log_wmix = jnp.atleast_2d(log_wmix)
@@ -164,7 +189,7 @@ class LoglikBuilder:
 
     def object_loglik_abund(self, R, P, Pi, base_lambda, a_nodes, log_wa,
                             phi=0.0):
-        """(N,) per-object log-likelihood with the abundance integrated/marginalized out:
+        """(N,) per-object log-likelihood with the abundance INTEGRATED OUT:
 
             a_n ~ sum_k exp(log_wa[k]) delta(a_nodes[k]),
             T[n,s,b] | a_n ~ Poisson(a_n * Pi[n,b] * base_lambda[s]).
@@ -184,3 +209,59 @@ class LoglikBuilder:
                 s, self._nb_tables(s, R, P), Pi, a_nodes * base_lambda[s])
         inner = logsumexp(acc_total + log_wa[None, :], axis=1)
         return self._zero_inflate(inner, phi, self.all_zero)
+
+    def _scan_components(self, R, P, inner_fn):
+        """(N, K) from a per-component inner log-likelihood.
+
+        Scanned over the component axis for the same reason ``_acc_over_rates``
+        scans over the rates: a Python loop lets XLA keep every component's
+        (N, T) tables live at once.  The structural-zero wrap is applied to the
+        whole (N, K) block afterwards -- phi is a property of the cell line, not
+        of the emission component.
+        """
+        R, P = as_components(R), as_components(P)
+
+        def body(carry, RP):
+            return carry, inner_fn(RP[0], RP[1])
+
+        _, innerT = jax.lax.scan(body, None, (R, P))            # (K, N)
+        return innerT.T
+
+    def object_loglik_components(self, R, P, Pi, rates, log_wmix, phi=0.0):
+        """(N, K) per-object log-likelihood under each emission component.
+
+        R, P : (K, S, B).  Otherwise exactly ``object_loglik``, once per
+        component; the mixture over components is NOT resolved here.
+        """
+        rates = jnp.atleast_2d(rates)
+        log_wmix = jnp.atleast_2d(log_wmix)
+
+        def inner_fn(Rk, Pk):
+            inner = jnp.zeros(self.N, dtype=jnp.float64)
+            for s in range(self.S):
+                acc = self._acc_over_rates(s, self._nb_tables(s, Rk, Pk), Pi,
+                                           rates[s])              # (N, K_rate)
+                inner = inner + logsumexp(acc + log_wmix[s][None, :], axis=1)
+            return inner
+
+        return self._zero_inflate(self._scan_components(R, P, inner_fn), phi,
+                                  self.all_zero[:, None])
+
+    def object_loglik_abund_components(self, R, P, Pi, base_lambda, a_nodes,
+                                       log_wa, phi=0.0):
+        """(N, K) version of ``object_loglik_abund``: the abundance is
+        integrated out separately under each emission component."""
+        a_nodes = jnp.asarray(a_nodes)
+        base_lambda = jnp.atleast_1d(jnp.asarray(base_lambda))
+
+        def inner_fn(Rk, Pk):
+            acc_total = jnp.zeros((self.N, a_nodes.shape[0]),
+                                  dtype=jnp.float64)
+            for s in range(self.S):
+                acc_total = acc_total + self._acc_over_rates(
+                    s, self._nb_tables(s, Rk, Pk), Pi,
+                    a_nodes * base_lambda[s])
+            return logsumexp(acc_total + log_wa[None, :], axis=1)
+
+        return self._zero_inflate(self._scan_components(R, P, inner_fn), phi,
+                                  self.all_zero[:, None])

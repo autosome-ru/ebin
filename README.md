@@ -61,32 +61,6 @@ Bins are ordered by the number in their name. Cell lines are fitted
 independently. **Empty fields are read as zero counts, not as missing data** —
 some exports write every zero as a blank, and treating those as missin
 
-## Install
-
-```bash
-pip install -e /path/to/package        # or place this directory on PYTHONPATH
-```
-
-`jax` (GPU strongly recommended), `numpy`, `scipy` and `pandas` are required.
-`xarray` + `h5netcdf` are needed only for the netCDF export and `matplotlib`
-only for the diagnostics. Everything runs in float64.
-
-## Input
-
-One row per sequence, a 3-level column header `(cell line, replicate, bin)`:
-
-```
-seq,       A549,A549,A549,A549,A549,...
-           rep1,rep1,rep1,rep1,rep2,...
-           bin1,bin2,bin3,bin4,bin1,...
-ACGT...,   112, 340, 88,  15,  97,  ...
-```
-
-Bins are ordered by the number in their name. Cell lines are fitted
-independently. **Empty fields are read as zero counts, not as missing data** —
-some exports write every zero as a blank, and treating those as missing deletes 
-the informative zeros of the low-abundance sequences.
-
 ## Use
 
 ```bash

@@ -18,6 +18,8 @@ so no tau summation is needed.
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
 
+from .model import as_components
+
 
 def log1mexp(x):
     """log(1 - e^x) for x < 0, stable on both ends."""
@@ -57,3 +59,35 @@ def log_zero_prob_abund(R, P, Pi, base_lambda, a_nodes, log_wa, mask):
         contrib = Pi * (zeta[s] * base_lambda[s])[None, :]            # (N, B)
         c = c + jnp.sum(jnp.where(mask[:, s, :], contrib, 0.0), axis=1)
     return logsumexp(log_wa[None, :] + a_nodes[None, :] * c[:, None], axis=1)
+
+
+def log_zero_prob_components(R, P, Pi, rates, log_wmix, mask):
+    """(N, K) all-zero log-probability, one column per emission component.
+
+    R, P : (K, S, B).  Cheap enough (no tau grid) to build the whole block at
+    once instead of scanning over components.
+    """
+    R, P = as_components(R), as_components(P)
+    rates = jnp.atleast_2d(rates)
+    log_wmix = jnp.atleast_2d(log_wmix)
+    zeta = P ** R - 1.0                                  # (K, S, B) <= 0
+    mzeta = jnp.where(mask[None], zeta[:, None, :, :], 0.0)      # (K, N, S, B)
+    a = jnp.einsum("nb,knsb->kns", Pi, mzeta)                    # (K, N, S)
+    t = a[:, :, :, None] * rates[None, None, :, :] \
+        + log_wmix[None, None, :, :]
+    return logsumexp(t, axis=3).sum(axis=2).T                    # (N, K)
+
+
+def log_zero_prob_abund_components(R, P, Pi, base_lambda, a_nodes, log_wa,
+                                   mask):
+    """(N, K) version of ``log_zero_prob_abund``."""
+    R, P = as_components(R), as_components(P)
+    base_lambda = jnp.atleast_1d(jnp.asarray(base_lambda))
+    a_nodes = jnp.asarray(a_nodes)
+    zeta = P ** R - 1.0                                          # (K, S, B)
+    c = jnp.zeros((zeta.shape[0], mask.shape[0]), dtype=jnp.float64)
+    for s in range(mask.shape[1]):
+        contrib = Pi[None] * (zeta[:, s, :] * base_lambda[s])[:, None, :]
+        c = c + jnp.sum(jnp.where(mask[None, :, s, :], contrib, 0.0), axis=2)
+    return logsumexp(log_wa[None, None, :] + a_nodes[None, None, :]
+                     * c[:, :, None], axis=2).T                  # (N, K)

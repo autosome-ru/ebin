@@ -241,11 +241,52 @@ def plot_gc_vs_abundance(table, sequences=None, groups=None, out=None,
     return _finish(fig, out)
 
 
-def plot_all(table, counts, outdir=".", groups=None):
-    """Write all three diagnostics into ``outdir``."""
+def plot_components(state, counts, groups=None, out=None, bins=80):
+    """The evidence for an emission mixture, in one figure.
+
+    Left: the cross-line mean of log relative depth -- the sequence-intrinsic
+    part of the read count, which is where a bimodal amplification shows up --
+    with the fitted components stacked on it.  A mixture that is doing real
+    work splits a visibly bimodal histogram; one that is splitting a smooth
+    unimodal one is fitting a tail, not a population.  Right: how confident the
+    assignment is, which says whether the cell lines agree.
+    """
+    from .mixture import relative_depth
+    _, plt = _plt()
+    gdata = counts if isinstance(counts, dict) else \
+        load_groups(counts, groups=groups, verbose=False)
+    order = [g for g in (groups or state.order) if g in gdata]
+    D = relative_depth(gdata, order)
+    seen = D > 0
+    L = np.where(seen, np.log10(np.maximum(D, 1e-6)), 0.0).sum(1) \
+        / np.maximum(seen.sum(1), 1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+    k, conf = state.assignment()
+    edges = np.linspace(np.nanpercentile(L, 0.2), np.nanpercentile(L, 99.8),
+                        bins + 1)
+    axes[0].hist([L[k == j] for j in range(state.K)], bins=edges, stacked=True,
+                 label=[f"component {j+1} ({state.pi[j]:.1%})"
+                        for j in range(state.K)])
+    axes[0].set_xlabel("mean log10 relative depth across cell lines")
+    axes[0].set_ylabel("sequences")
+    axes[0].legend(fontsize=8)
+    axes[1].hist(conf, bins=60, color="#3b6ea5")
+    axes[1].set_xlabel("posterior probability of the assigned component")
+    axes[1].set_ylabel("sequences")
+    axes[1].set_yscale("log")
+    fig.suptitle(f"shared emission components (K={state.K}), "
+                 f"{len(order)} cell lines", fontsize=10)
+    return _finish(fig, out)
+
+
+def plot_all(table, counts, outdir=".", groups=None, state=None):
+    """Write the diagnostics into ``outdir``."""
     import os
     os.makedirs(outdir, exist_ok=True)
     p = lambda n: os.path.join(outdir, n)
     plot_marginal_distribution(table, groups, out=p("marginal_effect_law.png"))
     plot_activity_vs_raw(table, counts, groups, out=p("activity_vs_raw.png"))
     plot_gc_vs_abundance(table, groups=groups, out=p("gc_vs_abundance.png"))
+    if state is not None and state.K > 1:
+        plot_components(state, counts, groups, out=p("components.png"))
