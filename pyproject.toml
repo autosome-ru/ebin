@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ebin"
-version = "1.1.0"
+version = "1.1.1"
 description = "Posterior bin-expectation normalization for sorting-based MPRA"
 requires-python = ">=3.9"
 dependencies = ["jax>=0.4", "numpy", "scipy", "pandas"]
+readme = "README.md" 
 
 [project.optional-dependencies]
 netcdf = ["xarray", "h5netcdf"]
