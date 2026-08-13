@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ebin"
-version = "1.1.1"
+version = "1.2.0"
 description = "Posterior bin-expectation normalization for sorting-based MPRA"
 requires-python = ">=3.9"
 dependencies = ["jax>=0.4", "numpy", "scipy", "pandas"]

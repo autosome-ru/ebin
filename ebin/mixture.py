@@ -73,6 +73,27 @@ from .initialize import init_from_fit
 _LOG_EPS = 1e-12
 
 
+def _buckets(cfg):
+    return int(cfg.get("tau_buckets", 6) or 1)
+
+
+def _rate_ceiling(cfg, Pi, a, abund_marg, a_headroom=1.0):
+    """Per-object bound on the latent rate a_n * Pi[n,b] * lambda_s.
+
+    Everything here is evaluated at an ALREADY FITTED (Pi, a), so the bound is
+    exact arithmetic rather than a guess: max_b Pi[n,b] times the abundance the
+    caller may still move a_n to.  Under the Gamma prior a_n is integrated out
+    over shared nodes, so there is nothing per-object to bound and the flat
+    ``a_max`` grid comes back.
+    """
+    lam = float(cfg["lambda_fix"])
+    if abund_marg or not cfg.get("abundance"):
+        return lam * (float(cfg["a_max"]) if abund_marg else 1.0)
+    a_bound = np.minimum(np.asarray(a, dtype=float) * a_headroom,
+                         float(cfg["a_max"]))
+    return lam * a_bound * np.asarray(Pi, dtype=float).max(axis=1)
+
+
 @dataclass
 class MixtureState:
     """Everything the EM produces beyond the per-line fits."""
@@ -122,14 +143,15 @@ def component_loglik(fit, X, mask):
     K = int(cfg.get("K", 1))
     conditional = bool(cfg.get("conditional", False))
     abund_marg = cfg.get("abundance_prior") is not None
-    a_max = (cfg["a_max"] if (cfg["abundance"] or abund_marg) else 1.0)
-    builder = LoglikBuilder(X, mask=mask, rate_max=cfg["lambda_fix"] * a_max)
 
     R, P = as_components(fit.R), as_components(fit.P)
     rates, log_w = jnp.asarray(fit.rates), jnp.asarray(fit.log_w)
     phi = 0.0 if conditional else float(fit.phi)
     Pi = jnp.asarray(fit.Pi)
     M = Pi if abund_marg else jnp.asarray(np.asarray(fit.a)[:, None]) * Pi
+    builder = LoglikBuilder(X, mask=mask, max_buckets=_buckets(cfg),
+                            rate_max=_rate_ceiling(cfg, fit.Pi, getattr(
+                                fit, "a", None), abund_marg))
 
     LL = _component_loglik_terms(builder, cfg, R, P, M, rates, log_w, phi)
     LL = np.asarray(LL, dtype=float).reshape(-1, K)
@@ -203,7 +225,12 @@ def ridge_step(fit, X, mask, gamma, max_shift=6.0):
     free_a = bool(cfg.get("abundance"))
     abund_marg = cfg.get("abundance_prior") is not None
     a_max = cfg["a_max"] if (free_a or abund_marg) else 1.0
-    builder = LoglikBuilder(X, mask=mask, rate_max=cfg["lambda_fix"] * a_max)
+    # the search multiplies a by exp(-(gamma . d)) with |d| <= max_shift, so
+    # the abundance can grow by at most e^max_shift before the a_max clip
+    builder = LoglikBuilder(
+        X, mask=mask, max_buckets=_buckets(cfg),
+        rate_max=_rate_ceiling(cfg, fit["Pi"], fit.get("a"), abund_marg,
+                               a_headroom=float(np.exp(max_shift))))
 
     R0 = as_components(np.asarray(fit["R"], dtype=float))
     P = as_components(np.asarray(fit["P"], dtype=float))
@@ -474,7 +501,7 @@ def fit_mixture(data, groups=None, *, K=2, em_rounds=4, em_tol=1.0,
     K = int(K)
     if em_rounds < 1:
         raise ValueError("em_rounds must be >= 1")
-    clash = {"K", "gamma", "a_init", "init"} & set(fit_kw)
+    clash = {"K", "gamma", "a_init", "init", "a_cap"} & set(fit_kw)
     if clash:
         raise ValueError(f"{sorted(clash)} are set by the EM, not by the "
                          "caller (use init_gamma / warm_from instead)")
@@ -506,10 +533,14 @@ def fit_mixture(data, groups=None, *, K=2, em_rounds=4, em_tol=1.0,
         print(f"[mixture] init: pi={np.round(pi, 4)} "
               f"amplification factors rho={np.round(rho, 4)}")
 
-    inits, a_inits, etas = {}, {}, {}
+    inits, a_inits, etas, caps = {}, {}, {}, {}
     for g in order:
         inits[g], a_inits[g] = _split_fit(fits0[g], rho, gamma)
         etas[g] = (fits0[g]["mu"], fits0[g]["sigma"])
+        # pass 0 already escalated the abundance bound; starting the M-steps
+        # from the converged caps keeps the escalation loop a no-op instead of
+        # re-running it on every round of every line
+        caps[g] = fits0[g].get("a_cap")
 
     # round 1 restarts every line from a freshly split pass-0 fit, so it gets
     # the full schedule; later rounds are warm starts and need far less
@@ -530,7 +561,7 @@ def fit_mixture(data, groups=None, *, K=2, em_rounds=4, em_tol=1.0,
             X, mask, _ = prep(gdata[g])
             res = fit_effects(X, mask=mask, K=K, gamma=gamma, init=inits[g],
                               a_init=a_inits[g], eta_init=etas[g],
-                              verbose=False, **kw)
+                              a_cap=caps[g], verbose=False, **kw)
             fit, gain = light(res), 0.0
             if ridge:
                 fit, gain = ridge_step(fit, X, mask, gamma)
@@ -538,6 +569,7 @@ def fit_mixture(data, groups=None, *, K=2, em_rounds=4, em_tol=1.0,
             inits[g] = init_from_fit(fit)
             a_inits[g] = np.asarray(fit["a"], dtype=float)
             etas[g] = (fit["mu"], fit["sigma"])
+            caps[g] = fit.get("a_cap")
             comp_ll[g] = component_loglik(fit, X, mask)
             if verbose:
                 print(f"  [em{rnd} {i+1}/{len(order)}] {g}: Q={res.loglik:.1f}"

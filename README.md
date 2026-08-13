@@ -111,6 +111,9 @@ Useful CLI options:
 --abundance gamma          integrate a_n out instead of fitting it
 --zero-truncation          drop all-zero rows instead of fitting them
 --grid 61x25               readout grid (n_mu x n_log_sigma)
+--a-max 20                 pin the abundance ceiling (default: auto, see below)
+--a-max-tol 0.001          sequences allowed to sit at the ceiling before it doubles
+--tau-buckets 6            latent-count grid lengths (1 = one grid for everybody)
 --save-fits fits.pkl       keep the fitted parameters
 --warm-from fits.pkl       start from an earlier fit of the same data
 --netcdf activity.nc       also write the full posterior (see below)
@@ -192,7 +195,10 @@ understanding before they are changed.
 | `mu_prior` | `1.3` | SD of the prior on the effect location. Bounding the effect *spread* alone still lets a single-bin low-count sequence run `mu_n` large and walk `Pi` to a vertex. The gauge pins Q50 = 0 and Q25 = −1, so the population SD is ≈ 1.5 and the between-sequence SD ≈ 1.1 — the gauge-consistent `tau` is ~1.3. A larger value (2–3) is inconsistent with the gauge and under-regularizes. |
 | `sigma_prior` | `(0.0, 0.5)` | Prior on `log sigma_n`. The per-sequence MLE is unbounded: a sequence whose reads land only in the outer bins wants a two-point mass, reachable only as `sigma → ∞`. Without this, `sigma` hits its bound in several cell lines; those are bad optima, so the prior often *improves* the data likelihood. `(0, 1)` fits marginally better on well-behaved lines but leaves stuck ones stuck. |
 | `lambda_fix` | `50.0` | The latent Poisson level is not identified upward — it rides the `R·lambda` ridge, and only products like `R(1−P)/P · Pi · lambda` are identified. It is held fixed and `R` absorbs the scale. |
-| `a_max` | `15.0` | Bound on `a_n`; also sizes the truncated latent-count grid, so raising it costs runtime and memory. |
+| `a_max` | `"auto"` | Ceiling on `a_n`. A fixed `15` was too low: it pinned 0.9–1.4 % of every lib2 cell line at the bound, and moving those sequences off it shifts the whole line's activity (median 0.03, up to 0.5), because the cuts are shared. `"auto"` starts at 20 and doubles the bound of whatever sits on it until under `bound_frac` do — the bound is per sequence, so only the deep ones ever carry a large one. A number pins it and reproduces the old behaviour. |
+| `bound_frac` | `0.001` | When `a_max="auto"`: the share of sequences allowed to remain at the bound. An inactive constraint does not move an optimum, so this is how close to "no ceiling at all" the fit is required to get. 0.5 % is measurably too loose — see below. |
+| `cap_headroom` | `3.0` | Where each sequence's bound starts, as a multiple of its own depth-derived abundance. Smaller is faster (it sizes that sequence's latent-count grid) and anything too small is caught and doubled, so this only trades one extra warm refit against grid length. |
+| `tau_buckets` | `6` | Distinct latent-count grid lengths the sequences are bucketed onto. `1` puts every sequence on a grid sized by the deepest one, which is what the model used to do: on lib1 that is 3× the arithmetic and a 2.1× slower gradient at `a_max = 20`, and 14× the arithmetic at `a_max = 100`, where it no longer fits in 16 GB. Each bucket is one more XLA kernel to compile, so this is a padding-vs-compile knob and 4 is nearly as good as 8. |
 | readout grid | `121 × 33` | `(mu, log sigma)` grid for the posterior mean. Converged in the bulk: doubling to `181 × 49` moves the median activity by 2e-6 (a handful of extreme low-count sequences move by up to 0.04), while halving to `61 × 25` moves it by 5e-3. |
 
 The readout re-uses the fit's own priors by default, so the posterior mean is
@@ -205,10 +211,11 @@ lines).
 
 One cell line of 30k sequences × 4 bins takes ~2–4 min on a GPU (fit + readout)
 and roughly 20× longer on CPU; the Gamma-abundance variant costs ~2× the
-free-`a_n` fit. Memory is dominated by the latent-count grid
-(`a_max · lambda_fix` wide); the likelihood scans over abundance/rate components
-so only one is live at a time. `XLA_PYTHON_CLIENT_PREALLOCATE=false` is set on
-import so JAX does not claim 75% of VRAM.
+free-`a_n` fit and does not bucket (its abundance nodes are shared across
+sequences, so there is nothing per-sequence to size a grid from). Memory is
+dominated by the latent-count grid; the likelihood scans over abundance/rate
+components so only one is live at a time. `XLA_PYTHON_CLIENT_PREALLOCATE=false`
+is set on import so JAX does not claim 75% of VRAM.
 
 
 ## Parameters

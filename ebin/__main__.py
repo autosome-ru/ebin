@@ -25,7 +25,16 @@ def _parse_args(argv=None):
                         "under a Gamma prior")
     p.add_argument("--nodes", type=int, default=24,
                    help="quadrature nodes for the Gamma abundance integral")
-    p.add_argument("--a-max", type=float, default=15.0)
+    p.add_argument("--a-max", default="auto",
+                   help="ceiling on the abundance a_n: a number pins it, "
+                        "'auto' (default) starts at 20 and doubles the bound "
+                        "of whatever sits on it until under --a-max-tol do")
+    p.add_argument("--a-max-tol", type=float, default=0.001,
+                   help="fraction of sequences allowed to sit at the "
+                        "abundance bound before it is raised again")
+    p.add_argument("--tau-buckets", type=int, default=6,
+                   help="distinct latent-count grid lengths the sequences are "
+                        "bucketed onto (1 = one grid sized by the deepest)")
     p.add_argument("--lambda-fix", type=float, default=50.0)
     p.add_argument("--mu-prior", type=float, default=1.3,
                    help="sd of the prior on the effect location (0 disables)")
@@ -61,9 +70,13 @@ def main(argv=None):
     n_mu, n_ls = (int(v) for v in a.grid.lower().split("x"))
     sigma_prior = None if a.sigma_prior.lower() == "none" else \
         tuple(float(v) for v in a.sigma_prior.split(","))
-    fit_kw = dict(conditional=a.zero_truncation, a_max=a.a_max,
+    a_max = a.a_max if a.a_max.lower() == "auto" else float(a.a_max)
+    fit_kw = dict(conditional=a.zero_truncation, a_max=a_max,
+                  tau_buckets=a.tau_buckets,
                   lambda_fix=a.lambda_fix, sigma_prior=sigma_prior,
                   sigma_shared=a.sigma_shared, mu_prior=a.mu_prior or None)
+    if a_max == "auto":
+        fit_kw["bound_frac"] = a.a_max_tol
     if a.abundance == "gamma":
         fit_kw.update(abundance=False, abundance_prior="gamma",
                       n_abund_nodes=a.nodes)

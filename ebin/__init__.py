@@ -24,8 +24,9 @@ jax.config.update("jax_enable_x64", True)
 
 from .data import GroupData, read_counts, load_groups, prep  # noqa: E402,F401
 from .initialize import initialize, init_from_fit, InitResult  # noqa: E402,F401
-from .fit import (fit_effects, FitResult, save_fits,  # noqa: E402,F401
-                  load_fits, StoredFit, light)
+from .fit import (fit_effects, fit_effects_adaptive, FitResult,  # noqa: E402,F401
+                  save_fits, load_fits, StoredFit, light,
+                  abundance_caps, initial_abundance)
 from .activity import posterior_activity  # noqa: E402,F401
 from .mixture import (fit_mixture, MixtureState, components_table,  # noqa: E402,F401
                       component_summary, component_loglik, relative_depth,
@@ -36,4 +37,4 @@ from .plots import (plot_marginal_distribution, plot_activity_vs_raw,  # noqa: E
                     plot_gc_vs_abundance, plot_components, plot_all,
                     raw_mass_center, gc_content, marginal_density)
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"

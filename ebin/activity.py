@@ -99,9 +99,8 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
     lambda_fix = cfg["lambda_fix"]
     # profile the abundance up to a_max whenever the fit modelled one, whether
     # as a free a_n or integrated out under the Gamma prior
-    a_max = (cfg["a_max"]
-             if (cfg["abundance"] or cfg.get("abundance_prior")) else 1.0)
-    rate_max = lambda_fix * a_max
+    a_max = float(cfg["a_max"]
+                  if (cfg["abundance"] or cfg.get("abundance_prior")) else 1.0)
     if tau_within == "auto":
         tau_within = cfg.get("mu_prior")
     if isinstance(sigma_prior, str):
@@ -125,10 +124,24 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
     Rn, Pn = np.asarray(R), np.asarray(P)
     c = Rn * (1 - Pn) / Pn                                     # (K, S, B)
 
-    builder = LoglikBuilder(X, mask=mask, rate_max=rate_max)
+    obs_mask = ~np.isnan(X) if np.issubdtype(X.dtype, np.floating) \
+        else np.ones(X.shape, bool)
+    if mask is not None:
+        obs_mask = obs_mask & np.asarray(mask, bool)
+    total = np.where(obs_mask, np.nan_to_num(X, nan=0.0), 0.0).sum((1, 2))
+
+    # The readout does not fit a_n, it PROFILES it: a = tot / (Pi . v) clipped
+    # to a_max, with v[k,b] = sum_s c[k,s,b] lambda_s.  Pi is a simplex row, so
+    # Pi . v >= min_b v[k,b] and the profiled abundance can never exceed
+    # tot / min_{k,b} v[k,b], whatever the grid point.  That is an exact
+    # per-object ceiling on the latent rate, and it is far below a_max for
+    # every object but the deepest -- which are the only ones that then pay for
+    # the long tau grid.
+    v_kb = np.einsum("ksb,s->kb", c, lam)                      # (K, B)
+    a_ceil = np.clip(total / max(float(v_kb.min()), 1e-12), 1e-4, a_max)
+    builder = LoglikBuilder(X, mask=mask, rate_max=lambda_fix * a_ceil,
+                            max_buckets=int(cfg.get("tau_buckets", 6) or 1))
     kept = np.asarray(res.observed)
-    Xz = np.where(np.asarray(builder.mask), np.nan_to_num(X, nan=0.0), 0.0)
-    total = Xz.sum((1, 2))                                     # observed reads
 
     # ---- pass 1: shared (mu, log sigma) grid, its readout and expected total
     mu_g = np.linspace(-mu_lim, mu_lim, n_mu)
@@ -139,7 +152,8 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
     Pi_g = np.asarray(normal_bin_probs(jnp.asarray(MU), jnp.exp(jnp.asarray(LS)),
                                        cuts))
     ebin_g = Pi_g @ bvec                                        # (G,)
-    # E[tot | a = 1] under each component: (K, G)
+    # E[tot | a = 1] under each component: (K, G).  Equivalently Pi_g @ v_kb --
+    # the form the tau ceiling above is bounded from.
     denom_g = np.stack([(c[k][None] * Pi_g[:, None, :]).sum(2) @ lam
                         for k in range(K)])
 
@@ -223,7 +237,7 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
         ls_nodes = (0.5 * (lo_ls + hi_ls)[:, None]
                     + 0.5 * (hi_ls - lo_ls)[:, None] * _unit_nodes(n_ls)[None])
 
-        v_kb = jnp.asarray(np.einsum("ksb,s->kb", c, lam))   # E[tot | a=1] per B
+        v_j = jnp.asarray(v_kb)                     # E[tot | a=1] per (K, B)
         tot_j = jnp.asarray(total)
 
         @jax.jit
@@ -259,7 +273,7 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
                 Pi = bin_probs(mu_col, jnp.asarray(ls_nodes[:, t]))
                 for k in range(K):
                     logpost[:, k, j] = np.asarray(
-                        ll_cols[k](Pi, abund(Pi, v_kb[k]))) + lp
+                        ll_cols[k](Pi, abund(Pi, v_j[k]))) + lp
         if K > 1:
             logpost += lg_off[:, :, None]
         logpost = logpost.reshape(N, K * G)
@@ -279,7 +293,7 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
                 j = i * n_ls + t
                 Pi = bin_probs(mu_col, jnp.asarray(ls_nodes[:, t]))
                 for k in range(K):
-                    acc["a"] += w[:, k, j] * np.asarray(abund(Pi, v_kb[k]))
+                    acc["a"] += w[:, k, j] * np.asarray(abund(Pi, v_j[k]))
                 Pi = np.asarray(Pi)
                 wj = w[:, :, j].sum(1)
                 e_j = Pi @ bvec

@@ -38,6 +38,18 @@ profile and becomes an abundance proxy.  Either fit a free a_n
 (``abundance_prior='gamma'``), which costs one global parameter instead of N and
 propagates the abundance uncertainty into the effect.
 
+The abundance bound.  a_n is box-constrained, and the bound does double duty: it
+is a modelling choice AND it sizes the truncated latent-count grid, so a
+generous one used to be paid for by every object at every step.  Both jobs are
+now per object.  ``a_cap`` is an (N,) ceiling, started at a small multiple of
+the object's own depth and doubled on whatever objects reach it, until fewer
+than ``bound_frac`` of them sit at their bound (``fit_effects_adaptive``, which
+is what ``a_max="auto"`` runs).  A constraint that is inactive does not move the
+optimum, so the escalation converges to the unconstrained fit; what it buys is
+that the tau grid is sized per object, and a deep sequence no longer makes a
+shallow one pay.  ``a_max`` remains the hard global ceiling -- a number pins it
+where it is, "auto" lets it escalate too.
+
 Emission mixture (K > 1).  The channel block then holds K sets of (R, P) and the
 data term is the RESPONSIBILITY-WEIGHTED log-likelihood
 
@@ -77,6 +89,32 @@ _GLOBAL_CYCLE = ["SLSQP", "TNC", "L-BFGS-B"]
 LOG_R_BOUND = 20.0
 
 
+def initial_abundance(X, mask, kept):
+    """(N,) starting size factor: the object's per-cell read total relative to
+    the geometric mean over the objects that count.  This is the quantity a_n
+    exists to explain, and the fit both starts a_n here and sizes its bound
+    from it."""
+    Xz = np.where(np.asarray(mask, bool), np.nan_to_num(np.asarray(X), nan=0.0),
+                  0.0)
+    cells = np.maximum(np.asarray(mask, bool).sum(axis=(1, 2)), 1)
+    rate_n = Xz.sum(axis=(1, 2)) / cells
+    ref = np.exp(np.mean(np.log(rate_n[kept] + 1e-6))) if np.any(kept) else 1.0
+    return rate_n / max(ref, 1e-12)
+
+
+def abundance_caps(X, mask, kept, a_max, headroom=3.0, floor=1.0):
+    """(N,) per-object ceiling on a_n: ``headroom`` times the depth-derived
+    start, floored so a low-count object can still move and clipped to the hard
+    ``a_max``.
+
+    This is what sizes the object's tau grid, so a tight headroom is cheap and a
+    loose one is not; anything that turns out to bind is doubled by
+    ``fit_effects_adaptive`` rather than guessed right in advance.
+    """
+    a0 = initial_abundance(X, mask, kept)
+    return np.clip(headroom * a0, floor, a_max)
+
+
 @dataclass
 class FitResult:
     R: np.ndarray                 # (S, B) emission size       -- (K, S, B) if K > 1
@@ -95,6 +133,7 @@ class FitResult:
     converged: bool
     observed: np.ndarray          # (N,) objects entering the fit
     a: np.ndarray = None          # (N,) fitted abundance (ones if not fitted)
+    a_cap: np.ndarray = None      # (N,) per-object bound a_n was fitted under
     n_zero_dropped: int = 0       # all-zero rows removed by the truncation
     extras: dict = None           # kappa / abundance CV under a Gamma prior
     history: list = field(repr=False, default=None)
@@ -113,8 +152,9 @@ def light(res):
     reads, plus the fitted per-object effect law and abundance."""
     return dict(R=res.R, P=res.P, rates=res.rates, log_w=res.log_w,
                 cuts=res.cuts, Pi=res.Pi, mu=res.mu, sigma=res.sigma, a=res.a,
-                observed=res.observed, phi=res.phi, loglik=res.loglik,
-                converged=res.converged, extras=res.extras, config=res.config)
+                a_cap=res.a_cap, observed=res.observed, phi=res.phi,
+                loglik=res.loglik, converged=res.converged, extras=res.extras,
+                config=res.config)
 
 
 def save_fits(path, fits):
@@ -221,7 +261,8 @@ def _eta_init(Pi0, target_probs):
 
 
 def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
-                conditional=False, abundance=True, a_max=15.0,
+                conditional=False, abundance=True, a_max="auto",
+                a_cap=None, cap_headroom=3.0, tau_buckets=6,
                 abundance_prior=None, n_abund_nodes=24,
                 kappa_init=None, kappa_bounds=(0.5, 4096.0),
                 sigma_prior=(0.0, 0.5), sigma_shared=False,
@@ -230,7 +271,8 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
                 pin_median=0.0, pin_left=-1.0, pin_weight=100.0,
                 pi_floor=1e-12, init=None,
                 max_outer=3, tol=1e-6, global_maxiter=80, eta_maxiter=40,
-                finish_maxiter=5000, finish_rounds=6, verbose=True):
+                finish_maxiter=5000, finish_rounds=6, verbose=True,
+                **adapt_kw):
     """Fit the normal-effects model to one cell line's (N, S, B) counts.
 
     conditional : zero-TRUNCATED likelihood -- all-zero rows are dropped from
@@ -241,9 +283,23 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         what aligns the cuts with the read-count structure.
     abundance / abundance_prior : fit a free per-object a_n, or integrate a_n
         out under a Gamma(kappa, mean=1) prior discretized on ``n_abund_nodes``
-        Gauss-Laguerre nodes (mutually exclusive).  ``a_max`` bounds a_n and
-        sizes the latent tau grid; under the Gamma prior it is only the grid
-        ceiling, since the far nodes carry negligible weight.
+        Gauss-Laguerre nodes (mutually exclusive).  Under the Gamma prior a_n is
+        not a parameter, so ``a_max`` is only the grid ceiling (the far nodes
+        carry negligible weight) and none of the per-object machinery below
+        applies.
+    a_max : hard global ceiling on a_n, or ``"auto"`` to let it escalate --
+        which runs ``fit_effects_adaptive`` and returns its result.  Extra
+        keyword arguments (``bound_frac``, ``max_rounds``, ``a_max_ceiling``)
+        are passed on to it and are an error otherwise.
+    a_cap, cap_headroom : the per-object ceiling on a_n, as an (N,) array or as
+        the multiple of the object's depth-derived start to derive one from.
+        It bounds a_n in the optimizer AND sizes that object's latent-count
+        grid, so it must be a real bound; ``fit_effects_adaptive`` doubles
+        whatever binds until almost nothing does.  A flat array reproduces the
+        single-grid behaviour exactly.
+    tau_buckets : how many distinct tau grid lengths the objects are bucketed
+        onto.  Each is one more XLA kernel to compile; 1 puts every object on
+        the longest grid, which is what the model did before.
     sigma_prior : (m, s) Normal prior on log sigma_n, or None.
     sigma_shared : fit ONE effect scale for the whole cell line instead of one
         per object, so every sequence differs only in its effect location mu_n
@@ -278,6 +334,26 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
 
     Defaults reproduce the shipped configuration.
     """
+    if isinstance(a_max, str):
+        if a_max != "auto":
+            raise ValueError(f"a_max must be a number or 'auto', got {a_max!r}")
+        return fit_effects_adaptive(
+            X, mask, lambda_fix=lambda_fix, lambda_init=lambda_init,
+            conditional=conditional, abundance=abundance, a_cap=a_cap,
+            cap_headroom=cap_headroom, tau_buckets=tau_buckets,
+            abundance_prior=abundance_prior, n_abund_nodes=n_abund_nodes,
+            kappa_init=kappa_init, kappa_bounds=kappa_bounds,
+            sigma_prior=sigma_prior, sigma_shared=sigma_shared,
+            mu_prior=mu_prior, mu_center=mu_center, K=K, gamma=gamma,
+            a_init=a_init, eta_init=eta_init, pin_median=pin_median,
+            pin_left=pin_left, pin_weight=pin_weight, pi_floor=pi_floor,
+            init=init, max_outer=max_outer, tol=tol,
+            global_maxiter=global_maxiter, eta_maxiter=eta_maxiter,
+            finish_maxiter=finish_maxiter, finish_rounds=finish_rounds,
+            verbose=verbose, **adapt_kw)
+    if adapt_kw:
+        raise TypeError(f"unexpected keyword arguments {sorted(adapt_kw)}; "
+                        "these only apply when a_max='auto'")
     t0 = time.time()
     X = np.asarray(X)
     N, S, B = X.shape
@@ -318,23 +394,47 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         init = initialize(X, mask=mask, lambda_init=lambda_init, verbose=False)
 
     spec = _Globals(S, B, lambda_fix, K)
-    # with an abundance the latent rate reaches a_max * lambda, so the
-    # truncated tau grid must be sized for it
-    rate_max = lambda_fix * (a_max if (abundance or abund_marg) else 1.0)
-    builder = LoglikBuilder(X, mask=mask, rate_max=rate_max)
+    a_max = float(a_max)
 
-    observed = np.asarray(builder.mask).any(axis=(1, 2))
+    # ``kept`` needs the mask and the all-zero rows, which is all the builder
+    # does to X, so derive them here: the caps have to exist BEFORE the builder,
+    # since they are what sizes its grids
+    obs_mask = ~np.isnan(X) if np.issubdtype(X.dtype, np.floating) \
+        else np.ones(X.shape, bool)
+    if mask is not None:
+        obs_mask = obs_mask & np.asarray(mask, bool)
+    observed = obs_mask.any(axis=(1, 2))
+    all_zero = np.where(obs_mask, np.nan_to_num(X, nan=0.0), 0.0
+                        ).sum(axis=(1, 2)) == 0
     if conditional:
-        all_zero = np.asarray(builder.all_zero)
         kept = observed & ~all_zero
         n_zero_dropped = int((observed & all_zero).sum())
-        n_obs = int(np.asarray(builder.mask)[kept].sum())
+        n_obs = int(obs_mask[kept].sum())
     else:
         kept = observed
         n_zero_dropped = 0
-        n_obs = builder.n_observed
+        n_obs = int(obs_mask.sum())
     if not kept.any():
         raise ValueError("no objects left to fit")
+
+    # a_n is bounded per object, and that same bound sizes the object's tau
+    # grid: the latent rate is a_n * Pi[n,b] * lambda_s with Pi a simplex row,
+    # so a_cap * lambda_fix dominates it for every (b, s).
+    if abundance:
+        if a_cap is None:
+            a_cap = abundance_caps(X, obs_mask, kept, a_max,
+                                   headroom=cap_headroom)
+        a_cap = np.clip(np.asarray(a_cap, dtype=float).reshape(-1), 1e-3, a_max)
+        if a_cap.shape != (N,):
+            raise ValueError(f"a_cap must be ({N},), got {a_cap.shape}")
+        rate_max = lambda_fix * a_cap
+    else:
+        # under the Gamma prior the abundance nodes are shared by every object,
+        # so there is nothing per-object to bucket on
+        a_cap = None
+        rate_max = lambda_fix * (a_max if abund_marg else 1.0)
+    builder = LoglikBuilder(X, mask=mask, rate_max=rate_max,
+                            max_buckets=tau_buckets)
 
     scale = 1.0 / max(n_obs, 1)
     kept_j = jnp.asarray(kept)
@@ -347,11 +447,15 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
     i_tail = N + n_sig                 # log a block, or the single log kappa
     i_kappa = i_tail
     if verbose:
+        grid = (f"tau_grid={builder.tau_lengths} sizes={builder.bucket_sizes} "
+                f"({builder.tau_work:.0f} nodes/object)"
+                if len(builder.buckets) > 1
+                else f"tau_grid={builder.tau_lengths[0]}")
         print(f"[fit] N={N} S={S} B={B} K={K} kept={int(kept.sum())} "
               f"(missing={int((~observed).sum())}, "
               f"zero-dropped={n_zero_dropped}) conditional={conditional} "
               f"abundance={'gamma' if abund_marg else abundance} "
-              f"tau_grid={builder.tau_full.shape[0]} "
+              f"a_max={a_max:g} {grid} "
               f"sigma_prior={sigma_prior} sigma_shared={sigma_shared} "
               f"mu_prior={mu_prior}")
 
@@ -511,27 +615,25 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
             # divided out, so a and the component do not start double-counting
             # the same depth
             la0 = np.log(np.clip(np.asarray(a_init, dtype=float),
-                                 1e-3, a_max * 0.9))
+                                 1e-3, a_cap * 0.9))
         else:
             # start a at the object's per-cell total relative to the group mean
             # (the quantity a exists to explain)
-            Xz = np.where(np.asarray(builder.mask),
-                          np.nan_to_num(X, nan=0.0), 0.0)
-            cells = np.maximum(np.asarray(builder.mask).sum(axis=(1, 2)), 1)
-            rate_n = Xz.sum(axis=(1, 2)) / cells    # depth-robust per-cell mean
-            ref = np.exp(np.mean(np.log(rate_n[kept] + 1e-6)))
-            la0 = np.log(np.clip(rate_n / max(ref, 1e-12), 1e-3, a_max * 0.9))
+            la0 = np.log(np.clip(initial_abundance(X, obs_mask, kept),
+                                 1e-3, a_cap * 0.9))
         la0 = np.asarray(la0, dtype=float).copy()
         la0[~kept] = 0.0
         la0 -= la0[kept].mean()                     # geometric mean pinned to 1
+        # re-centering can push an object past its own bound, and scipy needs a
+        # feasible start
+        la0 = np.clip(la0, np.log(1e-4), np.log(a_cap))
         eta = np.concatenate([eta, la0])
-        e_bounds += [(np.log(1e-4), np.log(a_max))] * N
+        e_bounds += [(np.log(1e-4), float(np.log(c))) for c in a_cap]
     if abund_marg:
         # start the Gamma shape from the object-total CV: a Gamma(kappa,
         # mean=1) has CV = 1/sqrt(kappa)
         if kappa_init is None:
-            Xz = np.where(np.asarray(builder.mask),
-                          np.nan_to_num(X, nan=0.0), 0.0)
+            Xz = np.where(obs_mask, np.nan_to_num(X, nan=0.0), 0.0)
             tot = Xz.sum(axis=(1, 2))[kept]
             mu_t = tot.mean()
             cv = tot.std() / mu_t if mu_t > 0 else 1.0
@@ -690,7 +792,7 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         R=R, P=P, mu=mu_hat, sigma=sig_hat,
         cuts=cuts_hat, Pi=Pi, rates=np.asarray(rates), log_w=np.asarray(log_w),
         phi=0.0 if conditional else float(phi), loglik=ll, a=a_hat,
-        n_observed=n_obs, converged=converged, observed=kept,
+        a_cap=a_cap, n_observed=n_obs, converged=converged, observed=kept,
         n_zero_dropped=n_zero_dropped, history=history,
         extras=({} if not abund_marg else
                 dict(kappa=kappa_hat, abund_cv=kappa_hat ** -0.5)),
@@ -699,6 +801,106 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
                     abundance_prior=abundance_prior,
                     n_abund_nodes=n_abund_nodes, kappa=kappa_hat,
                     sigma_prior=sigma_prior, sigma_shared=sigma_shared,
-                    mu_prior=mu_prior, K=K,
+                    mu_prior=mu_prior, K=K, tau_buckets=tau_buckets,
                     pin_median=pin_median, pin_left=pin_left,
                     pin_weight=pin_weight, pi_floor=pi_floor))
+
+
+def fit_effects_adaptive(X, mask=None, *, a_max=20.0, a_max_ceiling=4096.0,
+                         bound_frac=0.001, max_rounds=6, a_cap=None,
+                         cap_headroom=3.0, abundance=True, verbose=True,
+                         **kw):
+    """``fit_effects`` with the abundance bound raised until it stops binding.
+
+    The bound on a_n was underestimated: on some cell lines -- and on
+    essentially all of lib2 -- a percent or more of the sequences sit exactly at
+    ``a_max=15``, which is the model refusing to say how deep they are.  Raising
+    the bound for everybody is correct and slow, because it is also what sizes
+    the latent-count grid.  So the bound is per object and only the objects that
+    reach it are raised:
+
+      * start every object at ``cap_headroom`` times its depth-derived
+        abundance, clipped to ``a_max``;
+      * fit;
+      * double the ceiling of every object sitting at its own, up to
+        ``a_max_ceiling``, and refit warm from the previous fit;
+      * stop when fewer than ``bound_frac`` of the fitted objects are at their
+        bound, or when nothing can be raised any further.
+
+    ``bound_frac`` is worth being strict about, because a bound that still
+    binds anywhere moves the whole cell line -- the cuts are shared.  On
+    MDA-MB-231 (lib2), stopping at 0.5% leaves the ceiling at 20 and the
+    activity 0.026 (median) from the a_max=100 fit, barely better than the old
+    a_max=15 default's 0.032; 0.1% escalates to 80 and 0.05% to 160, where the
+    largest fitted a_n is 98 -- the bound has stopped binding by itself -- and
+    the activity is 0.004 from the reference, i.e. at the run-to-run noise
+    floor of two fits of the same configuration.  Four warm rounds cost about
+    what one fit on the full a_max=100 grid does, and never allocate it.
+
+    ``a_max`` here is where the GLOBAL ceiling starts rather than where it
+    stays: it rises with the caps, up to ``a_max_ceiling``.  Pass a number to
+    ``fit_effects`` instead to pin it.
+
+    An inactive box constraint does not move an optimum, so what this converges
+    to is the fit with no abundance ceiling at all -- reached without ever
+    sizing the tau grid for the deepest object in the line.
+
+    ``max_rounds`` is the cost bound, and it matters: an UNDER-CONVERGED fit
+    leaves objects at their bound for reasons that have nothing to do with the
+    bound, and the loop will then keep doubling.  Six rounds take the ceiling
+    from 20 to 640, which is past anything these libraries want; if a run keeps
+    escalating to the end of that, suspect the optimizer schedule rather than
+    the data.
+
+    Returns the last ``FitResult``; ``res.a_cap`` is the converged per-object
+    bound, which is the right ``a_cap`` to warm-start a later fit of the same
+    data with.
+    """
+    from .initialize import init_from_fit
+
+    if not abundance:
+        # no free a_n to bound (either it is fixed at 1 or integrated out)
+        return fit_effects(X, mask=mask, a_max=float(a_max),
+                           abundance=abundance, verbose=verbose, **kw)
+    X = np.asarray(X)
+    a_ceiling = float(a_max_ceiling)
+    ceiling = float(min(max(float(a_max), 1e-3), a_ceiling))
+
+    res = None
+    for rnd in range(1, int(max_rounds) + 1):
+        if res is not None:
+            kw = dict(kw, init=init_from_fit(res), a_init=res.a,
+                      eta_init=(res.mu, res.sigma))
+        res = fit_effects(X, mask=mask, a_max=ceiling, a_cap=a_cap,
+                          cap_headroom=cap_headroom, abundance=True,
+                          verbose=verbose, **kw)
+        cap, a, kept = res.a_cap, res.a, np.asarray(res.observed, bool)
+        n_kept = max(int(kept.sum()), 1)
+        at_bound = kept & (a >= (1.0 - 1e-3) * cap)
+        frac = at_bound.sum() / n_kept
+        if verbose:
+            print(f"[a_max] round {rnd}: {at_bound.sum()}/{n_kept} "
+                  f"({frac:.3%}) objects at their abundance bound; "
+                  f"ceiling={ceiling:g} max a={a[kept].max():.3g}", flush=True)
+        if frac <= bound_frac:
+            break
+        new_cap = np.where(at_bound, np.minimum(2.0 * cap, a_ceiling), cap)
+        # the global ceiling only rises far enough to hold the raised caps: it
+        # is still the number the readout clips its profiled abundance at, so
+        # doubling it for everyone because a handful of objects moved would
+        # change the readout for no reason
+        new_ceiling = float(min(max(ceiling, new_cap.max()), a_ceiling))
+        if np.array_equal(new_cap, cap) and new_ceiling == ceiling:
+            if verbose:
+                print(f"[a_max] ceiling {a_ceiling:g} reached with {frac:.3%} "
+                      "still at the bound; stopping", flush=True)
+            break
+        a_cap, ceiling = new_cap, new_ceiling
+    else:
+        if verbose:
+            print(f"[a_max] {max_rounds} rounds used without dropping below "
+                  f"{bound_frac:.3%}"
+                  + ("; the last fit did not converge either, so suspect the "
+                     "optimizer schedule rather than the ceiling"
+                     if not res.converged else ""), flush=True)
+    return res
