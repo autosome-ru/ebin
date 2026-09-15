@@ -32,13 +32,15 @@ def log_zero_prob(R, P, Pi, rates, log_wmix, mask):
     """(N,) log P(all observed cells of the object are zero), phi = 0.
 
     Mirrors ``LoglikBuilder.object_loglik``: the rate mixture sits outside the
-    product over b, per (object, replicate).
+    product over b, per (object, replicate).  ``Pi`` is (N, B), or (N, S, B)
+    when the abundance is replicate-specific.
     """
     rates = jnp.atleast_2d(rates)
     log_wmix = jnp.atleast_2d(log_wmix)
     zeta = P ** R - 1.0                                  # (S, B) <= 0
     mzeta = jnp.where(mask, zeta[None, :, :], 0.0)       # (N, S, B)
-    a = jnp.einsum("nb,nsb->ns", Pi, mzeta)              # (N, S)
+    a = jnp.einsum("nsb,nsb->ns" if jnp.ndim(Pi) == 3 else "nb,nsb->ns",
+                   Pi, mzeta)                            # (N, S)
     t = a[:, :, None] * rates[None, :, :] + log_wmix[None, :, :]
     return logsumexp(t, axis=2).sum(axis=1)
 

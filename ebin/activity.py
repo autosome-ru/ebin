@@ -22,6 +22,15 @@ formed from the other cell lines (``MixtureState.log_gamma_loo``).  The
 profiled abundance differs per component -- the same reads imply fewer cells
 when the sequence amplifies well -- so it is profiled per (component, grid
 point) too, and everything still comes from one set of weights.
+
+Under a sinh-arcsinh effect law the shape is held FIXED at its fitted value and
+the posterior is still taken over (mu_n, sigma_n) only.  A global (delta, eps)
+is a property of the cell line, so that is exactly right for it; a per-object
+eps_n is a fitted per-object quantity being plugged in rather than integrated
+over, so its uncertainty does not reach ``activity_sd``.  It also stops the
+first pass from sharing one grid across objects -- each node then carries an
+(N, B) profile instead of a (B,) one, which costs an extra bin-probability
+evaluation per node and nothing else.
 """
 
 import numpy as np
@@ -116,6 +125,16 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
         s_fix = float(np.median(np.asarray(res.sigma, dtype=float)))
         ls_lim, n_ls, sigma_prior = (s_fix, s_fix), 1, None
 
+    # the fitted effect-law shape, plugged in rather than integrated over
+    delta = getattr(res, "delta", None)
+    shape = None if delta is None else (jnp.asarray(float(delta)),
+                                        jnp.asarray(res.eps))
+    per_obj_shape = shape is not None and np.ndim(res.eps) > 0
+    if per_obj_shape and not adaptive:
+        raise NotImplementedError(
+            "a per-object sinh-arcsinh skew has no shared (mu, log sigma) "
+            "grid to be read off; use adaptive=True (the default)")
+
     cuts = jnp.asarray(res.cuts)
     R, P = as_components(res.R), as_components(res.P)            # (K, S, B)
     K = R.shape[0]
@@ -140,7 +159,8 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
     v_kb = np.einsum("ksb,s->kb", c, lam)                      # (K, B)
     a_ceil = np.clip(total / max(float(v_kb.min()), 1e-12), 1e-4, a_max)
     builder = LoglikBuilder(X, mask=mask, rate_max=lambda_fix * a_ceil,
-                            max_buckets=int(cfg.get("tau_buckets", 6) or 1))
+                            max_buckets=int(cfg.get("tau_buckets", 6) or 1),
+                            sum_mode=cfg.get("sum_mode", "grid"))
     kept = np.asarray(res.observed)
 
     # ---- pass 1: shared (mu, log sigma) grid, its readout and expected total
@@ -149,38 +169,73 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
     MU, LS = np.meshgrid(mu_g, ls_g, indexing="ij")
     MU, LS = MU.ravel(), LS.ravel()
     G = MU.size
-    Pi_g = np.asarray(normal_bin_probs(jnp.asarray(MU), jnp.exp(jnp.asarray(LS)),
-                                       cuts))
-    ebin_g = Pi_g @ bvec                                        # (G,)
-    # E[tot | a = 1] under each component: (K, G).  Equivalently Pi_g @ v_kb --
-    # the form the tau ceiling above is bounded from.
-    denom_g = np.stack([(c[k][None] * Pi_g[:, None, :]).sum(2) @ lam
-                        for k in range(K)])
 
-    def ll_grid_for(Rk, Pk):
-        """One jitted grid evaluation per component.  The emission tables are
-        closed over, not passed in: XLA folds them into the kernel, and with
-        K = 1 that reproduces the single-emission readout exactly."""
+    def ll_col_for(Rk, Pk):
+        """Object-likelihood column for a per-object (N, B) profile.  The
+        emission tables are closed over, not passed in: XLA folds them into the
+        kernel, and with K = 1 that reproduces the single-emission readout."""
         @jax.jit
-        def ll_grid(pi_row, a_col):
-            M = a_col[:, None] * pi_row[None, :]
+        def ll_col(Pi, a_col):
+            M = a_col[:, None] * Pi
             obj = builder.object_loglik(Rk, Pk, M, rates, log_w, 0.0)
             if not conditional:
                 return obj
             lz = jnp.minimum(
                 log_zero_prob(Rk, Pk, M, rates, log_w, builder.mask), -1e-12)
             return obj - log1mexp(lz)
-        return ll_grid
+        return ll_col
 
     ll = np.empty((N, K, G))
     a_grid = np.empty((N, K, G))
-    for k in range(K):
-        ll_grid = ll_grid_for(R[k], P[k])
+    if per_obj_shape:
+        # one profile per (object, node): the node supplies (mu, sigma) shared
+        # by every object, eps_n makes the row differ anyway
+        ones = jnp.ones(N)
+        v_j1 = jnp.asarray(v_kb)
+        tot_j1 = jnp.asarray(total)
+        ll_cols1 = [ll_col_for(R[k], P[k]) for k in range(K)]
+
+        @jax.jit
+        def _pi_node(mu_s, sig_s):
+            return normal_bin_probs(mu_s * ones, sig_s * ones, cuts,
+                                    shape=shape)
+
+        Pi_g, ebin_g, denom_g = None, None, None
         for j in range(G):
-            a_col = np.clip(total / max(denom_g[k, j], 1e-12), 1e-4, a_max)
-            a_grid[:, k, j] = a_col
-            ll[:, k, j] = np.asarray(ll_grid(jnp.asarray(Pi_g[j]),
-                                             jnp.asarray(a_col)))
+            Pi_j = _pi_node(float(MU[j]), float(np.exp(LS[j])))
+            for k in range(K):
+                a_col = np.asarray(jnp.clip(
+                    tot_j1 / jnp.maximum(Pi_j @ v_j1[k], 1e-12), 1e-4, a_max))
+                a_grid[:, k, j] = a_col
+                ll[:, k, j] = np.asarray(ll_cols1[k](Pi_j, jnp.asarray(a_col)))
+    else:
+        Pi_g = np.asarray(normal_bin_probs(
+            jnp.asarray(MU), jnp.exp(jnp.asarray(LS)), cuts, shape=shape))
+        ebin_g = Pi_g @ bvec                                    # (G,)
+        # E[tot | a = 1] under each component: (K, G).  Equivalently
+        # Pi_g @ v_kb -- the form the tau ceiling above is bounded from.
+        denom_g = np.stack([(c[k][None] * Pi_g[:, None, :]).sum(2) @ lam
+                            for k in range(K)])
+
+        def ll_grid_for(Rk, Pk):
+            @jax.jit
+            def ll_grid(pi_row, a_col):
+                M = a_col[:, None] * pi_row[None, :]
+                obj = builder.object_loglik(Rk, Pk, M, rates, log_w, 0.0)
+                if not conditional:
+                    return obj
+                lz = jnp.minimum(
+                    log_zero_prob(Rk, Pk, M, rates, log_w, builder.mask), -1e-12)
+                return obj - log1mexp(lz)
+            return ll_grid
+
+        for k in range(K):
+            ll_grid = ll_grid_for(R[k], P[k])
+            for j in range(G):
+                a_col = np.clip(total / max(denom_g[k, j], 1e-12), 1e-4, a_max)
+                a_grid[:, k, j] = a_col
+                ll[:, k, j] = np.asarray(ll_grid(jnp.asarray(Pi_g[j]),
+                                                 jnp.asarray(a_col)))
 
     # per-object prior over the grid: N(mu; center_n, tau^2) * N(ls; m_s, s_s)
     center = np.broadcast_to(np.asarray(mu_center, float), (N,))
@@ -242,23 +297,11 @@ def posterior_activity(res, X, mask, *, mu_center=0.0, tau_within="auto",
 
         @jax.jit
         def bin_probs(mu_col, ls_col):
-            return normal_bin_probs(mu_col, jnp.exp(ls_col), cuts)
+            return normal_bin_probs(mu_col, jnp.exp(ls_col), cuts, shape=shape)
 
         @jax.jit
         def abund(Pi, v_row):
             return jnp.clip(tot_j / jnp.maximum(Pi @ v_row, 1e-12), 1e-4, a_max)
-
-        def ll_col_for(Rk, Pk):
-            @jax.jit
-            def ll_col(Pi, a_col):
-                M = a_col[:, None] * Pi
-                obj = builder.object_loglik(Rk, Pk, M, rates, log_w, 0.0)
-                if not conditional:
-                    return obj
-                lz = jnp.minimum(
-                    log_zero_prob(Rk, Pk, M, rates, log_w, builder.mask), -1e-12)
-                return obj - log1mexp(lz)
-            return ll_col
 
         ll_cols = [ll_col_for(R[k], P[k]) for k in range(K)]
         logpost = np.empty((N, K, G))

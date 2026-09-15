@@ -35,10 +35,10 @@ thousands of nodes.  Sizing one grid by the deepest object and charging it to
 all N is what makes a large ``a_max`` expensive.  So ``rate_max`` may be an (N,)
 array of per-object rate ceilings; objects are then bucketed onto a few shared
 grid lengths (chosen to minimize the total padded work) and each bucket is
-summed on its own grid.  On the 3'UTR libraries that is ~390 nodes per object
-against the 5462 an a_max=100 grid needs, so raising a_max costs a few percent
-instead of 4.5x -- and stays inside a 16 GB card, which the shared grid at that
-ceiling does not.
+summed on its own grid.  On a typical library that is ~390 nodes per object
+against the 5462 an a_max=100 shared grid needs, so raising a_max costs a few
+percent instead of 4.5x -- and stays inside a 16 GB card, which the shared grid
+at that ceiling does not.
 
 The ceiling is a BOUND, not an estimate: whatever supplies it must guarantee
 that a_n * Pi[n,b] * lambda_s stays under it for every (b, s) the likelihood is
@@ -50,7 +50,7 @@ and the mixture it is exact algebra on quantities that are already fixed.
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.scipy.special import gammaln, logsumexp
+from jax.scipy.special import digamma, gammaln, logsumexp
 from scipy.stats import poisson as _sp_poisson
 
 from .gauss_rules import compute_nodes_and_logweights, Rules
@@ -62,6 +62,36 @@ _NEG_INF = -jnp.inf
 # no bucket is shorter than this: below it the grid costs nothing anyway and the
 # extra kernel is not worth compiling
 _MIN_TAU = 16
+
+# Mode-centred rule: nodes per cell and the level set they span.
+#
+# MEASURED, against a brute-force lattice sum over 174 (R, P, m, x) cells
+# spanning m in [0.5, 5e4] and x/(c m) in [0.02, 20]:
+#
+#     W   D     max |err|   median    cells > 1e-6
+#    21  30      1.10e-03   3.3e-12       8 / 174
+#    25  30      4.59e-04   4.4e-12       4 / 174
+#    31  45      5.99e-04   9.5e-13       5 / 174
+#    41  60      1.62e-06   4.0e-13       1 / 174
+#    51  75      4.53e-08   3.2e-13       0 / 174
+#    61  90      2.26e-08   3.2e-13       0 / 174
+#
+# The "0.68 decimal digits per node" balance assumes a GAUSSIAN bump and does
+# not hold at the crossover.  The bad cells are all small m with small x, where
+# sigma ~ 1.3-1.7 sits just past the Delta = 1 clamp: the lattice has been
+# abandoned but the integral approximation is not yet valid.  Decomposed on the
+# worst cell (R=1, P=0.5, m=5, x=2, err 1.1e-3):
+#
+#     truncation (integers <= 16 vs exact)   -4.3e-08   <- negligible
+#     sum -> integral                        +4.9e-04   <- dominant
+#     trapezoid -> integral                  +6.2e-04   <- dominant
+#
+# i.e. it is NOT truncation, which is why the edge-drop certificate cannot see
+# it (see ``logmarg_window``).  W = 51 pushes the crossover to sigma ~ 3.4 where
+# the Gaussian estimate does hold, and costs 51 constant nodes against the dense
+# grid's 373 (shallow) to 207691 (a_max=4096).
+WINDOW_NODES = 51
+WINDOW_LEVEL = 75.0
 
 
 def nb_logpmf(x, r, p):
@@ -156,6 +186,137 @@ def gamma_mixture_rule(alpha, mean, num_nodes):
     return nodes * (mean / alpha), logw
 
 
+def _trigamma(y):
+    """psi'(y) by an upward-shifted asymptotic series.
+
+    Only ever sets the NODE SPACING, never the value, so a relative error of
+    1e-6 is irrelevant -- and it is a great deal cheaper than a true trigamma.
+    """
+    z = y + 3.0
+    zi = 1.0 / z
+    p = zi * (1.0 + 0.5 * zi + zi * zi / 6.0 - zi ** 4 / 30.0)
+    return p + 1.0 / y ** 2 + 1.0 / (y + 1.0) ** 2 + 1.0 / (y + 2.0) ** 2
+
+
+def mode_scale(x, m, R, P, iters=4):
+    """(tau_hat, sigma): mode and curvature scale of the log-summand
+
+        l(tau) = tau log m - m - lgamma(tau+1)
+               + lgamma(x + R tau) - lgamma(R tau) - lgamma(x+1)
+               + R tau log P + x log(1-P),
+
+    which is strictly concave in tau for x > 0 (l'' = -psi'(tau+1)
+    + R^2 [psi'(x+R tau) - psi'(R tau)], and psi' is decreasing), so the mode is
+    unique.
+
+    Two details are load-bearing, because a mode estimate that is silently wrong
+    gives a window that is silently too narrow:
+
+    * START FROM THE CLOSED FORM.  psi(y) ~ log y and then x >> R tau collapse
+      the stationarity condition to tau_0 = [m (P x / R)^R]^(1/(R+1)), which is
+      within a few percent of the mode across the whole range.  A naive start
+      such as min(m, x/c) can be orders of magnitude out.
+    * ITERATE IN u = log tau.  With F(u) = l'(e^u), F'(u) = tau l''(tau) lies in
+      [-(1+R), -1]: monotone, bounded away from 0 and from infinity, so Newton
+      needs no step clipping and converges in ~4 steps.  Newton in tau needs
+      clipping to stay positive, and a clipped step cannot cross several orders
+      of magnitude -- it stops short and reports a plausible wrong answer.
+
+    Placement only: the caller stop_gradients this.
+    """
+    lo = jnp.log(jnp.maximum(m, 1e-300)) + R * jnp.log(P)
+    u = (lo + R * jnp.log(jnp.maximum(x / R, 1e-300))) / (R + 1.0)
+    u = jnp.clip(u, -30.0, 30.0)
+
+    def step(u, _):
+        t = jnp.exp(u)
+        F = lo - digamma(t + 1.0) + R * (digamma(x + R * t) - digamma(R * t))
+        Fp = t * (-_trigamma(t + 1.0)
+                  + R ** 2 * (_trigamma(x + R * t) - _trigamma(R * t)))
+        return jnp.clip(u - F / jnp.minimum(Fp, -1e-12), -30.0, 30.0), None
+
+    u, _ = jax.lax.scan(step, u, None, length=int(iters))
+    t = jnp.exp(u)
+    neg_h = _trigamma(t + 1.0) - R ** 2 * (_trigamma(x + R * t)
+                                           - _trigamma(R * t))
+    return t, 1.0 / jnp.sqrt(jnp.maximum(neg_h, 1e-300))
+
+
+def logmarg_window(x, m, R, P, W=WINDOW_NODES, D=WINDOW_LEVEL, certify=False):
+    """(n,) log sum_tau Pois(tau|m) NB(x|R tau, P) on W mode-centred nodes.
+
+    The dense grid spans the support of the PRIOR (length ~ m) at unit spacing,
+    while the summand is a bump of width sigma = O(sqrt(m/(1+R))) sitting at its
+    own mode.  Centring on that mode and spacing by the curvature removes both
+    factors, so the work is O(W) with no dependence on m, on depth, or on a_max.
+
+    Nodes span the l_max - D level set, half-width h = sqrt(2D) sigma, spacing
+    Delta = max(1, 2h/(W-1)).  The clamp splits two regimes, and it is not a
+    special case: Delta = 1 is exactly where a lattice stops resolving the bump.
+
+    * Delta == 1 -- the nodes are consecutive integers and log Delta = 0, so
+      this is an EXACT windowed lattice sum, arithmetically the dense grid
+      restricted to the nodes carrying mass.  ~85% of cells in practice.
+    * Delta > 1 -- a uniform rule on the reals, i.e. trapezoid for the integral.
+      By Poisson summation the integer sum and the strided sum approximate the
+      same integral and differ by O(exp(-2 pi^2 sigma^2 / Delta^2)); since Delta
+      is proportional to sigma that is a CONSTANT, so accuracy does not decay
+      with depth.
+
+    Balancing window truncation exp(-D) against aliasing
+    exp(-pi^2 (W-1)^2 / 4D) gives D_opt = pi (W-1)/2 and an error floor
+    exp(-pi (W-1)/2) -- about 0.68 decimal digits per node, independent of
+    everything else.
+
+    ``certify=True`` also returns the edge drop l_max - l(edge).  Log-concavity
+    makes the discarded tail a geometric series, so a drop >= D certifies a
+    relative TRUNCATION error O(exp(-D)) -- a runtime property of the number
+    actually computed, needing no bound on a_n.  Contrast the dense grid, whose
+    criterion bounds only the ABSOLUTE prior mass dropped and can therefore be
+    wrong in the log by an unbounded amount (see ``sum_mode``).
+
+    **The certificate bounds truncation ONLY, and truncation is not the
+    dominant error.**  Measured on the worst cell of a 174-cell sweep
+    (R=1, P=0.5, m=5, x=2): the realised error is 1.1e-3 while the certificate
+    reports exp(-14.6) = 4.7e-7, off by 2300x -- because truncation there is
+    4.3e-8 and the error is really sum-vs-integral (4.9e-4) plus
+    trapezoid-vs-integral (6.2e-4), neither of which moves the edge drop.  Do
+    not use the drop as an error bound in the Delta > 1 regime; use it as what
+    it is, a truncation check.  The defence against the other two is W (see
+    WINDOW_NODES), which pushes the crossover to a sigma where the Gaussian
+    aliasing estimate is actually valid.
+    """
+    x = jnp.asarray(x)
+    # x == 0 has a closed form; the window branch still has to return something
+    # FINITE there or jnp.where would propagate NaN into its gradient
+    xs = jnp.maximum(x, 1.0)
+    log_m = jnp.log(jnp.maximum(m, 1e-300))
+    t_hat, sig = jax.lax.stop_gradient(mode_scale(xs, m, R, P))
+    half = jnp.sqrt(2.0 * D) * sig
+    delta = jnp.maximum(1.0, 2.0 * half / (W - 1.0))
+    centre = jnp.where(delta <= 1.0, jnp.round(t_hat), t_hat)
+    j = jnp.arange(W, dtype=jnp.float64) - (W - 1.0) / 2.0
+    nodes = centre[:, None] + delta[:, None] * j[None, :]
+    live = nodes > 0.0                       # tau <= 0 contributes nothing
+    t = jnp.where(live, nodes, 1.0)          # keep the dead nodes finite
+    lp = (t * log_m[:, None] - m[:, None] - gammaln(t + 1.0)
+          + gammaln(xs[:, None] + R * t) - gammaln(R * t)
+          - gammaln(xs[:, None] + 1.0)
+          + R * t * jnp.log(P) + xs[:, None] * jnp.log1p(-P))
+    lp = jnp.where(live, lp, _NEG_INF)
+    # sum_tau Pois(tau|m) P^(R tau) = exp(m (P^R - 1)): the Poisson PGF at the
+    # NB zero mass, exact and free (the same identity truncation.py uses)
+    val = jnp.where(x == 0, m * (P ** R - 1.0),
+                    logsumexp(lp, axis=1) + jnp.log(delta))
+    if not certify:
+        return val
+    peak = jnp.max(lp, axis=1)
+    inf = jnp.asarray(jnp.inf, dtype=lp.dtype)
+    left = jnp.where(live[:, 0], peak - lp[:, 0], inf)      # a dead edge
+    right = jnp.where(live[:, -1], peak - lp[:, -1], inf)   # truncates nothing
+    return val, jnp.where(x == 0, inf, jnp.minimum(left, right))
+
+
 @jax.checkpoint
 def _logmarg_one_rate(log_em_n, mu_n, tau, lg):
     """(N,) log sum_tau NB(x | R*tau, P) * Poisson(tau | mu_n) for one rate.
@@ -176,15 +337,25 @@ class _TauBucket:
     rather than to the whole line's.
     """
 
-    __slots__ = ("idx", "n", "tau", "lg", "xu", "inv", "mask")
+    __slots__ = ("idx", "n", "tau", "lg", "xu", "inv", "mask", "xf")
 
-    def __init__(self, idx, T, Xi, mask):
+    def __init__(self, idx, T, Xi, mask, tables=True):
         S, B = Xi.shape[1], Xi.shape[2]
         self.idx = jnp.asarray(idx)
         self.n = int(idx.size)
+        Xg, mg = Xi[idx], mask[idx]
+        self.mask = [[jnp.asarray(mg[:, s, b]) for b in range(B)]
+                     for s in range(S)]
+        if not tables:
+            # the window rule evaluates one row per cell, so the unique-value
+            # table has nothing to share and the tau grid does not exist
+            self.tau = self.lg = self.xu = self.inv = None
+            self.xf = [[jnp.asarray(Xg[:, s, b], dtype=jnp.float64)
+                        for b in range(B)] for s in range(S)]
+            return
+        self.xf = None
         self.tau = jnp.arange(int(T), dtype=jnp.float64)
         self.lg = gammaln(self.tau + 1.0)
-        Xg, mg = Xi[idx], mask[idx]
         self.xu = [[None] * B for _ in range(S)]
         self.inv = [[None] * B for _ in range(S)]
         for s in range(S):
@@ -192,8 +363,6 @@ class _TauBucket:
                 xu, inv = np.unique(Xg[:, s, b], return_inverse=True)
                 self.xu[s][b] = jnp.asarray(xu, dtype=jnp.float64)
                 self.inv[s][b] = jnp.asarray(inv)
-        self.mask = [[jnp.asarray(mg[:, s, b]) for b in range(B)]
-                     for s in range(S)]
 
 
 class LoglikBuilder:
@@ -208,11 +377,34 @@ class LoglikBuilder:
         region the likelihood is evaluated in -- see the module docstring.
     max_buckets : how many distinct grid lengths to allow.  Each one is a
         separate XLA kernel, so this trades compile time against padding; 1
-        restores a single shared grid.
+        restores a single shared grid.  Ignored by ``sum_mode="window"``.
+    sum_mode : how the latent count is summed out.
+
+        "grid" (default) -- the dense truncated lattice described above.
+        "window" -- ``logmarg_window``: W nodes centred on the mode of the
+            SUMMAND, spaced by its curvature.  Work is O(N S B W) with W a
+            compile-time constant, so there is ONE kernel and no dependence on
+            m, on depth or on ``a_max`` -- the bucketing machinery is not
+            needed and ``rate_max`` is not read.
+
+        The two also differ in CORRECTNESS, not only in cost.  The grid is
+        sized from a quantile of the PRIOR, which implicitly assumes the
+        summand peaks below it; when x > c m the reads argue for more latent
+        cells than m supplies and the mode moves ABOVE m, and above the grid if
+        a_max is tight.  Its criterion bounds the ABSOLUTE prior mass dropped,
+        which is not a bound on the error in the log -- so it can be wrong by an
+        unbounded amount while looking ordinary.  Measured on a low-depth
+        line at a_max=15, two cells of 120000 were off by 180 and 59 nats (239
+        between them), and the gradient by 33% at a_max=5, against a
+        brute-force sum to tau=400000; the window rule matched it to 5e-10.  The
+        affected cells are the deepest sequences -- the ones pinned at the
+        ceiling.  Both agree to 1e-13 once a_max >= 40.
+    window, window_level : W and D for ``sum_mode="window"``.
     """
 
     def __init__(self, X, mask=None, rate_max=200.0, tail_eps=1e-10,
-                 max_buckets=6):
+                 max_buckets=6, sum_mode="grid", window=WINDOW_NODES,
+                 window_level=WINDOW_LEVEL):
         X = np.asarray(X)
         if X.ndim != 3:
             raise ValueError("X must have shape (N, S, B)")
@@ -232,6 +424,26 @@ class LoglikBuilder:
         self.X = Xi
         self.all_zero = jnp.asarray((Xi * mask).sum(axis=(1, 2)) == 0)
         self.n_observed = int(mask.sum())
+
+        if sum_mode not in ("grid", "window"):
+            raise ValueError(f"sum_mode must be 'grid' or 'window', "
+                             f"got {sum_mode!r}")
+        self.sum_mode = sum_mode
+        self.window = int(window)
+        self.window_level = float(window_level)
+        if sum_mode == "window":
+            # no bound is needed and no grid is sized, so rate_max is not read;
+            # one bucket in object order keeps every gather an identity
+            self.rate_max = float(np.max(np.asarray(rate_max, np.float64)))
+            self.lengths = np.array([self.window], dtype=np.int64)
+            self.buckets = [_TauBucket(np.arange(self.N), 0, Xi, mask,
+                                       tables=False)]
+            self._flat = True
+            self._unsort = None
+            self.bucket_sizes = [self.N]
+            self.tau_lengths = [self.window]
+            self.tau_full = self.lg_tau_full = None
+            return
 
         rm = np.asarray(rate_max, dtype=np.float64)
         if rm.size not in (1, self.N) or not np.all(np.isfinite(rm)) \
@@ -266,7 +478,8 @@ class LoglikBuilder:
     @property
     def tau_work(self):
         """Mean tau nodes summed per object -- the cost the buckets actually
-        pay, against ``max(tau_lengths)`` for one shared grid."""
+        pay, against ``max(tau_lengths)`` for one shared grid.  Under
+        ``sum_mode="window"`` it is W, by construction."""
         return sum(n * T for n, T in zip(self.bucket_sizes, self.tau_lengths)) \
             / max(self.N, 1)
 
@@ -279,20 +492,26 @@ class LoglikBuilder:
         out = parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=0)
         return out if self._flat else out[self._unsort]
 
-    def _acc_over_rates(self, bk, s, tbls, Pi, rates_s):
+    def _acc_over_rates(self, bk, s, R, P, Pi, rates_s):
         """(n_g, K) sum over b of the masked log-marginals, one column per rate.
 
         Scanned with a rematerialized body so only ONE rate's (n_g, T)
         intermediates are live at a time; a plain loop over k lets XLA allocate
         all K concurrently (tens of GB at N=30000).
         """
-        tau, lg = bk.tau, bk.lg
         mask_s = bk.mask[s]
+        window = self.sum_mode == "window"
+        tbls = None if window else self._nb_tables(bk, s, R, P)
+        tau, lg = bk.tau, bk.lg
+        W, D = self.window, self.window_level
 
         def body(carry, rate):
             acc_k = jnp.zeros(bk.n, dtype=jnp.float64)
             for b in range(self.B):
-                lm = _logmarg_one_rate(tbls[b], Pi[:, b] * rate, tau, lg)
+                m_b = Pi[:, b] * rate
+                lm = (logmarg_window(bk.xf[s][b], m_b, R[s, b], P[s, b], W, D)
+                      if window
+                      else _logmarg_one_rate(tbls[b], m_b, tau, lg))
                 acc_k = acc_k + jnp.where(mask_s[b], lm, 0.0)
             return carry, acc_k
 
@@ -311,13 +530,25 @@ class LoglikBuilder:
         """(N,) from a per-bucket inner log-likelihood, back in object order."""
         return self._scatter([fn(bk) for bk in self.buckets])
 
+    @staticmethod
+    def _rep(Pi_g, s):
+        """This replicate's (n_g, B) rows of a profile block.
+
+        A 2-D block is shared across replicates (the usual a_n * Pi[n,b]); a
+        3-D (n, S, B) one carries a row per replicate, which is what a
+        replicate-specific abundance a_{n,s} * Pi[n,b] produces.  Nothing else
+        in the likelihood changes -- cells of different replicates are already
+        independent given their rows.
+        """
+        return Pi_g if Pi_g.ndim == 2 else Pi_g[:, s]
+
     def _inner_rates(self, bk, R, P, Pi, rates, log_wmix):
         """(n_g,) with the latent-rate mixture resolved inside each replicate."""
         Pi_g = self._rows(bk, Pi)
         inner = jnp.zeros(bk.n, dtype=jnp.float64)
         for s in range(self.S):
-            acc = self._acc_over_rates(bk, s, self._nb_tables(bk, s, R, P),
-                                       Pi_g, rates[s])              # (n_g, M)
+            acc = self._acc_over_rates(bk, s, R, P, self._rep(Pi_g, s),
+                                       rates[s])                    # (n_g, M)
             inner = inner + logsumexp(acc + log_wmix[s][None, :], axis=1)
         return inner
 
@@ -328,8 +559,7 @@ class LoglikBuilder:
         acc = jnp.zeros((bk.n, a_nodes.shape[0]), dtype=jnp.float64)
         for s in range(self.S):
             acc = acc + self._acc_over_rates(
-                bk, s, self._nb_tables(bk, s, R, P), Pi_g,
-                a_nodes * base_lambda[s])
+                bk, s, R, P, self._rep(Pi_g, s), a_nodes * base_lambda[s])
         return logsumexp(acc + log_wa[None, :], axis=1)
 
     @staticmethod
@@ -344,10 +574,11 @@ class LoglikBuilder:
         """(N,) per-object log-likelihood.
 
         Pi : (N, B) rows fed to the latent Poisson (a_n * profile when an
-             abundance is fitted).  rates / log_wmix : (S, M) latent rates and
-             their log-weights (M = 1 for the fixed-rate model; unrelated to
-             the K emission components).  phi : object level zero-inflation
-             probability.
+             abundance is fitted), or (N, S, B) when the abundance is
+             replicate-specific, a_{n,s} * profile.  rates / log_wmix : (S, M)
+             latent rates and their log-weights (M = 1 for the fixed-rate
+             model; unrelated to the K emission components).  phi : object
+             level zero-inflation probability.
         """
         rates = jnp.atleast_2d(rates)
         log_wmix = jnp.atleast_2d(log_wmix)

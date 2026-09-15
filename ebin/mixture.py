@@ -77,6 +77,10 @@ def _buckets(cfg):
     return int(cfg.get("tau_buckets", 6) or 1)
 
 
+def _sum_mode(cfg):
+    return cfg.get("sum_mode", "grid")
+
+
 def _rate_ceiling(cfg, Pi, a, abund_marg, a_headroom=1.0):
     """Per-object bound on the latent rate a_n * Pi[n,b] * lambda_s.
 
@@ -150,6 +154,7 @@ def component_loglik(fit, X, mask):
     Pi = jnp.asarray(fit.Pi)
     M = Pi if abund_marg else jnp.asarray(np.asarray(fit.a)[:, None]) * Pi
     builder = LoglikBuilder(X, mask=mask, max_buckets=_buckets(cfg),
+                            sum_mode=_sum_mode(cfg),
                             rate_max=_rate_ceiling(cfg, fit.Pi, getattr(
                                 fit, "a", None), abund_marg))
 
@@ -228,7 +233,7 @@ def ridge_step(fit, X, mask, gamma, max_shift=6.0):
     # the search multiplies a by exp(-(gamma . d)) with |d| <= max_shift, so
     # the abundance can grow by at most e^max_shift before the a_max clip
     builder = LoglikBuilder(
-        X, mask=mask, max_buckets=_buckets(cfg),
+        X, mask=mask, max_buckets=_buckets(cfg), sum_mode=_sum_mode(cfg),
         rate_max=_rate_ceiling(cfg, fit["Pi"], fit.get("a"), abund_marg,
                                a_headroom=float(np.exp(max_shift))))
 

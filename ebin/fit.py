@@ -1,7 +1,8 @@
 """Maximum-marginal-likelihood fit of the normal-effects compound model.
 
 Parameters split into a global block theta = [log R, logit P, logit phi] (S*B
-channels) and a per-object block eta = [mu, log sigma, (log a | log kappa)].
+channels) and a per-object block eta = [mu, log sigma, (log a | log kappa),
+(log delta, eps)].
 The optimizer runs a short block-coordinate warmup (global block over a
 SLSQP/TNC/L-BFGS-B cycle, then the eta block) followed by joint finishing rounds
 (TNC, falling back to L-BFGS-B).  Steps are accepted on the PENALIZED objective,
@@ -27,8 +28,21 @@ Regularization (all in the pinned gauge, where the cut spacing is 1):
   runs mu_n large and its Pi walks to a simplex vertex (activity exactly 1 or
   B).  The gauge pins Q50 = 0 and Q25 = -1, i.e. population sd ~ 1.5 and
   between-object sd ~ 1.1, so the gauge-consistent tau is ~1.3, not 3.
+* ``eps_prior``  Normal prior on the sinh-arcsinh skew, and only interesting
+  when that skew is per object: with B = 4 bins an object has 3 degrees of
+  freedom, so (mu, sigma, eps) per object is a SATURATED profile -- free Pi in
+  disguise, with free Pi's no-shrinkage behaviour.  The prior is what makes it a
+  regularized free Pi rather than a reparameterized one.
 * the soft gauge pin, which costs nothing at the optimum (the likelihood
   gradient along the gauge is exactly zero) and is applied exactly on exit.
+
+Effect law.  ``shash`` replaces the Normal link by the sinh-arcsinh family
+(effects.py): ``"global"`` fits one (delta, eps) for the cell line, ``"eps"``
+fits a shared delta and a per-object eps.  Both nest the Normal exactly at
+(delta, eps) = (1, 0), which is where the fit starts, so the likelihood can only
+improve and the difference is a clean nested test.  The gauge is unaffected --
+the shape acts on the z-score (q_b - mu_n)/sigma_n, which the affine map leaves
+alone -- so ``gauge_normalize`` and the pins apply verbatim.
 
 Abundance.  Without one, every object has the same expected latent total
 (lambda_s), so any real depth variation has nowhere to go but Pi, which tilts
@@ -73,6 +87,7 @@ from scipy.optimize import minimize
 from scipy.special import ndtri
 
 from .model import LoglikBuilder, gamma_mixture_rule
+from .batch import broadcast_tilt
 from .initialize import initialize
 from .effects import mixture_quantiles, normal_bin_probs, gauge_normalize
 from .truncation import (log_zero_prob, log_zero_prob_abund, log1mexp,
@@ -134,6 +149,8 @@ class FitResult:
     observed: np.ndarray          # (N,) objects entering the fit
     a: np.ndarray = None          # (N,) fitted abundance (ones if not fitted)
     a_cap: np.ndarray = None      # (N,) per-object bound a_n was fitted under
+    delta: float = None           # sinh-arcsinh tail weight (None = Normal law)
+    eps: np.ndarray = None        # its skew: scalar, or (N,) when per object
     n_zero_dropped: int = 0       # all-zero rows removed by the truncation
     extras: dict = None           # kappa / abundance CV under a Gamma prior
     history: list = field(repr=False, default=None)
@@ -152,7 +169,8 @@ def light(res):
     reads, plus the fitted per-object effect law and abundance."""
     return dict(R=res.R, P=res.P, rates=res.rates, log_w=res.log_w,
                 cuts=res.cuts, Pi=res.Pi, mu=res.mu, sigma=res.sigma, a=res.a,
-                a_cap=res.a_cap, observed=res.observed, phi=res.phi,
+                a_cap=res.a_cap, delta=res.delta, eps=res.eps,
+                observed=res.observed, phi=res.phi,
                 loglik=res.loglik, converged=res.converged, extras=res.extras,
                 config=res.config)
 
@@ -266,10 +284,14 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
                 abundance_prior=None, n_abund_nodes=24,
                 kappa_init=None, kappa_bounds=(0.5, 4096.0),
                 sigma_prior=(0.0, 0.5), sigma_shared=False,
-                mu_prior=1.3, mu_center=None,
+                mu_prior=1.3, mu_center=None, sum_mode="grid",
+                shash=None, eps_prior=(0.0, 0.5), shape_init=None,
+                delta_bounds=(0.2, 5.0), eps_bounds=(-4.0, 4.0),
                 K=1, gamma=None, a_init=None, eta_init=None,
                 pin_median=0.0, pin_left=-1.0, pin_weight=100.0,
-                pi_floor=1e-12, init=None,
+                pi_floor=1e-12, init=None, tilt=None,
+                tilt_design=None, tilt_prior=None, tilt_init=None,
+                tilt_bounds=(-6.0, 6.0), tilt_shared=False, tilt_fixed=None,
                 max_outer=3, tol=1e-6, global_maxiter=80, eta_maxiter=40,
                 finish_maxiter=5000, finish_rounds=6, verbose=True,
                 **adapt_kw):
@@ -297,6 +319,13 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         grid, so it must be a real bound; ``fit_effects_adaptive`` doubles
         whatever binds until almost nothing does.  A flat array reproduces the
         single-grid behaviour exactly.
+    sum_mode : how the latent count is summed out -- "grid" (the dense
+        truncated lattice, the default and what every earlier fit used) or
+        "window" (``model.logmarg_window``: a constant number of nodes centred
+        on the mode of the summand).  The window rule makes the cost
+        independent of depth and of ``a_max``, ignores ``tau_buckets``, and does
+        not need the abundance bound to be valid at all -- see
+        ``model.LoglikBuilder`` for why the two can also DISAGREE.
     tau_buckets : how many distinct tau grid lengths the objects are bucketed
         onto.  Each is one more XLA kernel to compile; 1 puts every object on
         the longest grid, which is what the model did before.
@@ -310,6 +339,62 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         single scalar and is effectively inert.
     mu_prior, mu_center : sd and target of the Normal prior on mu_n (None
         disables).  ``mu_center`` may be an (N,) array.
+    tilt : fixed (N, S, B) -- or (S, B), or (N, B) -- multiplicative factor on
+        the latent rate, mirroring ``fit_free_pi``'s ``tilt``.  UNLIKE free-Pi,
+        where Pi is a saturated (N, B-1) free profile and a fixed rate factor
+        is provably absorbed exactly when S = 1 (see
+        ``scripts/test_batch_saturation.py``), here Pi is constrained to the
+        ``normal_bin_probs(mu_n, sigma_n, cuts)`` family -- only 2 (or 3, under
+        ``shash``) free dof per object against the tilt's up to B-1 -- so a
+        fixed tilt is NOT generally absorbable by refitting (mu_n, sigma_n)
+        even at S = 1.  Whether it moves a WELL-DETERMINED (high-depth) object
+        at all is a separate, empirical question: for such an object the
+        likelihood dominates the mu_prior/sigma_prior regularization either
+        way, so the tilt still competes against real information in the
+        counts, it merely competes through a narrower family than free-Pi's.
+        mu_n / sigma_n themselves are read out as the DE-TILTED location and
+        scale -- no readout change is needed, same convention as free-Pi.
+    tilt_design, tilt_prior, tilt_init, tilt_bounds, tilt_shared, tilt_fixed :
+        the tilt as a FITTED parameter rather than a supplied offset.
+        ``tilt_design`` is an (N, B, P) design tensor, centred over bins, and
+        the fit carries free amplitudes ``alpha`` of shape (S, P) -- or (1, P)
+        with ``tilt_shared`` -- entering the latent rate as
+
+            rate[n,s,b]  *=  exp( sum_p tilt_design[n,b,p] * alpha[s,p] ).
+
+        Fitting it rather than fixing it is what makes the correction a
+        statement the data can contradict: a supplied offset can only cost
+        likelihood if it is wrong (that is why HepG2 lost 347 nats in the
+        reptilt run), while a fitted one comes with a curvature, a standard
+        error and a likelihood-ratio test.  ``tilt_prior`` is the sd of a
+        Normal(0, .) shrinkage prior on alpha -- a scalar, or a (P,) array, or
+        an (S, P) array to shrink each sample toward 0 by a different amount;
+        ``None`` leaves the amplitudes unpenalized (pure profile ML).
+        ``tilt_fixed`` is an (S, P) offset ADDED to the fitted alpha and held
+        fixed, so a hierarchical mean can be carried while the deviation is
+        fitted.  Both this and ``tilt`` may be given: the two factors multiply.
+
+        Note what identifies alpha here.  A GC-dependent shift of mu_n alone is
+        absorbed EXACTLY by refitting mu (it is a relabelling of the per-object
+        effect location), so the part of the design lying in the effect law's
+        tangent space is identified only through the mu / sigma priors and
+        through the variation of that tangent space across objects.  The
+        returned ``extras`` therefore carries the curvature of BOTH the data
+        term and the penalized objective; they answer different questions and
+        on this panel they differ.
+    shash : effect law.  ``None`` is the Normal, and reproduces every earlier
+        fit bit for bit.  ``"global"`` fits one sinh-arcsinh (delta, eps) for
+        the whole cell line, ``"eps"`` a shared delta with a per-object eps.
+        Both start at (1, 0), which IS the Normal, so the fit is nested and the
+        likelihood gain is a likelihood-ratio statistic with 2 (or N+1) dof.
+    eps_prior : (m, s) Normal prior on the skew, on the same 1/n_obs scale as
+        the data term.  It matters only for ``shash="eps"``, where eps_n is the
+        third free parameter of a 3-dof object and so is otherwise unshrunk (a
+        reparameterized free Pi).  ``None`` disables it.
+    shape_init : (delta, eps) to start the shape from; ``None`` starts at the
+        Normal.  Pass the previous fit's when warm-starting.
+    delta_bounds, eps_bounds : boxes on the shape.  delta is bounded away from 0
+        (it multiplies asinh, so delta -> 0 flattens the law to a point mass).
     K, gamma : number of emission components and the (N, K) responsibilities
         that weight them.  K = 1 (the default) is the plain single-emission
         model and ignores ``gamma``.  For K > 1 this is an EM M-step: ``gamma``
@@ -340,13 +425,19 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         return fit_effects_adaptive(
             X, mask, lambda_fix=lambda_fix, lambda_init=lambda_init,
             conditional=conditional, abundance=abundance, a_cap=a_cap,
-            cap_headroom=cap_headroom, tau_buckets=tau_buckets,
+            cap_headroom=cap_headroom, tau_buckets=tau_buckets, tilt=tilt,
             abundance_prior=abundance_prior, n_abund_nodes=n_abund_nodes,
             kappa_init=kappa_init, kappa_bounds=kappa_bounds,
             sigma_prior=sigma_prior, sigma_shared=sigma_shared,
-            mu_prior=mu_prior, mu_center=mu_center, K=K, gamma=gamma,
+            mu_prior=mu_prior, mu_center=mu_center,
+            sum_mode=sum_mode, shash=shash, eps_prior=eps_prior, shape_init=shape_init,
+            delta_bounds=delta_bounds, eps_bounds=eps_bounds,
+            K=K, gamma=gamma,
             a_init=a_init, eta_init=eta_init, pin_median=pin_median,
             pin_left=pin_left, pin_weight=pin_weight, pi_floor=pi_floor,
+            tilt_design=tilt_design, tilt_prior=tilt_prior,
+            tilt_init=tilt_init, tilt_bounds=tilt_bounds,
+            tilt_shared=tilt_shared, tilt_fixed=tilt_fixed,
             init=init, max_outer=max_outer, tol=tol,
             global_maxiter=global_maxiter, eta_maxiter=eta_maxiter,
             finish_maxiter=finish_maxiter, finish_rounds=finish_rounds,
@@ -376,6 +467,16 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         # mu / sigma priors, which are not weighted
         raise ValueError("gamma rows must sum to 1 (they are responsibilities)")
     gamma_j = jnp.asarray(gamma)
+
+    if shash not in (None, False, "global", "eps"):
+        raise ValueError(f"shash must be None, 'global' or 'eps', got {shash!r}")
+    shash = shash or None
+    if shash and K > 1:
+        raise NotImplementedError(
+            "the sinh-arcsinh effect law is not wired through the emission "
+            "mixture (the component axis and the shape block would both have "
+            "to enter mixture.py's E-step)")
+    n_eps = 0 if shash is None else (N if shash == "eps" else 1)
 
     abund_marg = abundance_prior is not None       # abundance integrated out
     if abund_marg:
@@ -433,21 +534,85 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         # so there is nothing per-object to bucket on
         a_cap = None
         rate_max = lambda_fix * (a_max if abund_marg else 1.0)
+    if tilt is not None:
+        if abund_marg:
+            raise NotImplementedError(
+                "tilt is not wired through the Gamma-marginalized abundance "
+                "path")
+        tilt_np = broadcast_tilt(tilt, N, S, B)
+        rate_max = np.asarray(rate_max, float) * tilt_np.max(axis=(1, 2))
+        tilt_j = jnp.asarray(tilt_np)
+
+    n_tilt_rows = 0
+    if tilt_design is not None:
+        if abund_marg:
+            raise NotImplementedError(
+                "tilt_design is not wired through the Gamma-marginalized "
+                "abundance path")
+        V = np.asarray(tilt_design, float)
+        if V.ndim == 2:                         # (N, B) -> one amplitude
+            V = V[:, None, :, None]
+        elif V.ndim == 3:                       # (N, B, P), shared over samples
+            V = V[:, None, :, :]
+        if V.ndim != 4 or V.shape[0] != N or V.shape[2] != B \
+                or V.shape[1] not in (1, S):
+            raise ValueError(
+                f"tilt_design must be (N, B), (N, B, P) or (N, S, B, P) with "
+                f"N={N}, S={S}, B={B}; got {np.shape(tilt_design)}")
+        V = np.broadcast_to(V, (N, S, B, V.shape[3]))
+        # a component common to all bins is an abundance and a_n eats it, so
+        # the design is centred over bins -- exactly the gauge batch.py uses.
+        # A sample-varying design is what expresses the one tilt contrast the
+        # likelihood identifies WITHOUT help from the effect law: give
+        # replicate 1 and replicate 2 of a line opposite signs and the shared
+        # amplitude is their deviation, in which the line's biology cancels
+        # exactly because the profile Pi is shared and the tilt is not.
+        V = V - V.mean(axis=2, keepdims=True)
+        P_tilt = V.shape[3]
+        n_tilt_rows = 1 if tilt_shared else S
+        n_tilt = n_tilt_rows * P_tilt
+        V_j = jnp.asarray(V)
+        lo_t, hi_t = (float(tilt_bounds[0]), float(tilt_bounds[1]))
+        if tilt_fixed is None:
+            tilt_off_j = jnp.zeros((n_tilt_rows, P_tilt))
+        else:
+            tilt_off_j = jnp.asarray(np.broadcast_to(
+                np.asarray(tilt_fixed, float), (n_tilt_rows, P_tilt)))
+        # the tau grid is sized once, so it must hold for every amplitude the
+        # optimizer can reach: max_b sum_p V[n,b,p] alpha[s,p] <= sum_p
+        # max_b|V[n,b,p]| * max|alpha_p|.  A loose bound costs grid nodes, and
+        # nothing at all under sum_mode="window", which never reads rate_max.
+        amax_box = max(abs(lo_t), abs(hi_t)) + float(
+            np.abs(np.asarray(tilt_off_j)).max(initial=0.0))
+        head = np.exp((np.abs(V).max(axis=(1, 2)) * amax_box).sum(axis=1))
+        rate_max = np.asarray(rate_max, float) * head
+        if sum_mode != "window":
+            print(f"[fit] tilt_design: rate_max inflated by up to "
+                  f"{head.max():.3g}x for the amplitude box; sum_mode='window'"
+                  " avoids this entirely")
     builder = LoglikBuilder(X, mask=mask, rate_max=rate_max,
-                            max_buckets=tau_buckets)
+                            max_buckets=tau_buckets, sum_mode=sum_mode)
 
     scale = 1.0 / max(n_obs, 1)
     kept_j = jnp.asarray(kept)
     w_np = kept.astype(np.float64)
     w_np /= w_np.sum()
     w_mix = jnp.asarray(w_np)          # uniform over the objects that count
-    # eta = [mu (N), log sigma (N or 1), log a (N) | log kappa (1)]
+    # eta = [mu (N), log sigma (N or 1), log a (N) | log kappa (1),
+    #        log delta (1), eps (1 or N)]
+    # the shape block goes LAST so every index below it keeps its meaning
     n_sig = 1 if sigma_shared else N
     i_sig = N
     i_tail = N + n_sig                 # log a block, or the single log kappa
     i_kappa = i_tail
+    i_shape = i_tail + (N if abundance else (1 if abund_marg else 0))
+    # the tilt block goes after the shape block, for the same reason the shape
+    # block goes after the abundance one: every index above keeps its meaning
+    i_tilt = i_shape + (0 if shash is None else 1 + n_eps)
     if verbose:
-        grid = (f"tau_grid={builder.tau_lengths} sizes={builder.bucket_sizes} "
+        grid = (f"tau_window={builder.window} (mode-centred)"
+                if sum_mode == "window" else
+                f"tau_grid={builder.tau_lengths} sizes={builder.bucket_sizes} "
                 f"({builder.tau_work:.0f} nodes/object)"
                 if len(builder.buckets) > 1
                 else f"tau_grid={builder.tau_lengths[0]}")
@@ -457,7 +622,8 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
               f"abundance={'gamma' if abund_marg else abundance} "
               f"a_max={a_max:g} {grid} "
               f"sigma_prior={sigma_prior} sigma_shared={sigma_shared} "
-              f"mu_prior={mu_prior}")
+              f"mu_prior={mu_prior}"
+              + (f" shash={shash} eps_prior={eps_prior}" if shash else ""))
 
     # --- objective ----------------------------------------------------------
     def _log_sigma(eta):
@@ -465,18 +631,58 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         ls = eta[i_sig:i_sig + n_sig]
         return jnp.broadcast_to(ls, (N,)) if sigma_shared else ls
 
+    def _shape(eta):
+        """(delta, eps) of the sinh-arcsinh law, or None for the Normal.
+
+        A GLOBAL eps stays a scalar rather than being broadcast to (N,): the
+        mixture solve and the bin probabilities both then see one number, which
+        is cheaper and, more to the point, keeps the two configurations
+        distinguishable downstream.
+        """
+        if shash is None:
+            return None
+        eps = eta[i_shape + 1:i_shape + 1 + n_eps]
+        return jnp.exp(eta[i_shape]), (eps if shash == "eps" else eps[0])
+
     def _pi_and_cuts(eta):
         mu = eta[:N]
         sig = jnp.exp(_log_sigma(eta))
-        cuts = mixture_quantiles(mu, sig, w_mix, target_probs)
-        return normal_bin_probs(mu, sig, cuts, floor=pi_floor), cuts
+        shape = _shape(eta)
+        cuts = mixture_quantiles(mu, sig, w_mix, target_probs, shape=shape)
+        return normal_bin_probs(mu, sig, cuts, floor=pi_floor,
+                                shape=shape), cuts
+
+    def _alpha(eta):
+        """(n_tilt_rows, P) fitted tilt amplitudes, offset included."""
+        return eta[i_tilt:i_tilt + n_tilt].reshape(n_tilt_rows, -1) \
+            + tilt_off_j
+
+    def _tilt_free(eta):
+        """(N, S, B) multiplicative factor from the fitted amplitudes.
+
+        ``V`` is centred over bins, so the factor has log-mean 0 over b for
+        every object and carries no abundance -- the same normalisation
+        ``batch.tilt_factor`` applies to a supplied one.
+        """
+        E = jnp.einsum("nsbp,sp->nsb", V_j, _alpha(eta)) if not tilt_shared \
+            else jnp.einsum("nsbp,p->nsb", V_j, _alpha(eta)[0])
+        return jnp.exp(E)
 
     def _rows_and_cuts(eta):
-        """Rows fed to the latent Poisson: the profile, or a_n * profile."""
+        """Rows fed to the latent Poisson: the profile, or a_n * profile.
+
+        With ``tilt`` given this becomes (N, S, B): the object's profile is
+        shared across replicates as always, the tilt is not.
+        """
         Pi, cuts = _pi_and_cuts(eta)
-        if not abundance:
-            return Pi, cuts
-        return jnp.exp(eta[i_tail:i_tail + N])[:, None] * Pi, cuts
+        M = (jnp.exp(eta[i_tail:i_tail + N])[:, None] * Pi if abundance
+             else Pi)
+        if tilt is not None:
+            M = M[:, None, :] * tilt_j
+        if tilt_design is not None:
+            Tf = _tilt_free(eta)
+            M = (M[:, None, :] * Tf) if M.ndim == 2 else (M * Tf)
+        return M, cuts
 
     def _abund_rule(eta):
         """(nodes, log weights) of the Gamma(kappa, mean=1) abundance prior."""
@@ -576,9 +782,45 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         quad = jnp.sum(jnp.where(kept_j, (eta[:N] - mu_center_j) ** 2, 0.0))
         return scale * quad / (2.0 * mu_prior ** 2)
 
+    def _eps_pen(eta):
+        """-log prior on the sinh-arcsinh skew, on the 1/n_obs scale.
+
+        Per object this is the shrinkage that separates the model from a
+        saturated free-Pi profile; global it is one term against n_obs cells,
+        i.e. inert, and left in only so the two configurations are graded under
+        the same objective.
+        """
+        if shash is None or eps_prior is None:
+            return 0.0
+        m_e, s_e = eps_prior
+        e = eta[i_shape + 1:i_shape + 1 + n_eps]
+        quad = (jnp.sum(jnp.where(kept_j, (e - m_e) ** 2, 0.0))
+                if shash == "eps" else jnp.sum((e - m_e) ** 2))
+        return scale * quad / (2.0 * s_e ** 2)
+
+    tilt_sd_j = None
+    if tilt_design is not None and tilt_prior is not None:
+        tilt_sd_j = jnp.asarray(np.broadcast_to(
+            np.asarray(tilt_prior, float), (n_tilt_rows, P_tilt)))
+
+    def _tilt_pen(eta):
+        """-log prior on the tilt amplitudes, on the same 1/n_obs scale as the
+        data term.
+
+        A per-SAMPLE parameter against n_obs cells, so any prior wide enough to
+        be honest is nearly inert -- which is the point: the shrinkage that
+        matters is applied between samples, by the hierarchical model that
+        chooses this sd, not inside one line's fit.
+        """
+        if tilt_sd_j is None:
+            return 0.0
+        a = eta[i_tilt:i_tilt + n_tilt].reshape(n_tilt_rows, -1)
+        return scale * jnp.sum((a / tilt_sd_j) ** 2) / 2.0
+
     def _neg_obj(theta, eta):
         return (_data_neg_ll(theta, eta) + _gauge_pen(eta)
-                + _sigma_pen(eta) + _mu_pen(eta))
+                + _sigma_pen(eta) + _mu_pen(eta) + _eps_pen(eta)
+                + _tilt_pen(eta))
 
     vg_global = jax.jit(jax.value_and_grad(_neg_obj, argnums=0))
     vg_eta = jax.jit(jax.value_and_grad(
@@ -646,6 +888,33 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
         if verbose:
             print(f"[fit] gamma abundance: nodes={n_abund_nodes} "
                   f"kappa_init={k0:.3g} (CV~{1/np.sqrt(k0):.2f})")
+    if shash is not None:
+        # (1, 0) IS the Normal, so an unspecified start puts the fit exactly at
+        # the model it generalizes and every nat gained from here is real
+        d0, e0 = (1.0, np.zeros(n_eps)) if shape_init is None else \
+            (float(shape_init[0]),
+             np.broadcast_to(np.asarray(shape_init[1], float), (n_eps,)))
+        d0 = float(np.clip(d0, delta_bounds[0] * 1.001, delta_bounds[1] * 0.999))
+        e0 = np.clip(np.asarray(e0, float), eps_bounds[0] * 0.999,
+                     eps_bounds[1] * 0.999)
+        eta = np.concatenate([eta, [np.log(d0)], e0])
+        e_bounds += [(np.log(delta_bounds[0]), np.log(delta_bounds[1]))]
+        e_bounds += [tuple(float(v) for v in eps_bounds)] * n_eps
+    if tilt_design is not None:
+        # alpha = 0 IS the no-tilt model, so an unspecified start puts the fit
+        # exactly at the model it nests and every nat from here is a
+        # likelihood-ratio statistic with n_tilt dof
+        a0 = (np.zeros((n_tilt_rows, P_tilt)) if tilt_init is None else
+              np.broadcast_to(np.asarray(tilt_init, float),
+                              (n_tilt_rows, P_tilt)).astype(float))
+        # clipped to the box exactly, not to a shrunken one: tilt_bounds=(c, c)
+        # is how an amplitude is PINNED, and a start nudged off c would fit a
+        # different model
+        a0 = np.clip(a0, lo_t, hi_t).reshape(-1)
+        eta = np.concatenate([eta, a0])
+        e_bounds += [(lo_t, hi_t)] * n_tilt
+    if len(eta) != i_tilt + (0 if tilt_design is None else n_tilt):
+        raise AssertionError("eta layout and its index map disagree")
 
     # start in the pinned gauge (the affine map rescales every sigma by the
     # same k, so a shared scale stays shared)
@@ -753,13 +1022,14 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
     # --- exact gauge normalization + invariance check -----------------------
     # the affine gauge acts on (mu, sigma, cuts) only; a_n and kappa are
     # invariant under it
-    tail = np.asarray(eta[i_tail:], dtype=float)         # log a | log kappa
+    tail = np.asarray(eta[i_tail:i_shape], dtype=float)  # log a | log kappa
+    shape_blk = np.asarray(eta[i_shape:], dtype=float)   # log delta, eps
     mu_hat = np.asarray(eta[:N], dtype=float)
     sig_hat = np.exp(np.asarray(eta[i_sig:i_sig + n_sig], dtype=float))
     mu_hat, sig_hat, cuts_hat = gauge_normalize(
         mu_hat, sig_hat, np.asarray(cuts_fn(jnp.asarray(eta))),
         pin_median=pin_median, pin_left=pin_left)
-    eta_norm = np.concatenate([mu_hat, np.log(sig_hat), tail])
+    eta_norm = np.concatenate([mu_hat, np.log(sig_hat), tail, shape_blk])
     ll_norm = current_ll(theta, eta_norm)
     if abs(ll_norm - ll) > max(1e-6 * abs(ll), 1e-3):
         # should never happen (exact invariance) -- keep the better point
@@ -780,30 +1050,66 @@ def fit_effects(X, mask=None, *, lambda_fix=50.0, lambda_init=50.0,
     sig_hat = np.broadcast_to(sig_hat, (N,)).copy()
     a_hat = np.exp(tail[:N]) if abundance else np.ones(N)
     kappa_hat = float(np.exp(eta_final[i_kappa])) if abund_marg else None
+    delta_hat, eps_hat, shape_hat = None, None, None
+    if shash is not None:
+        delta_hat = float(np.exp(eta_final[i_shape]))
+        eps_blk = np.asarray(eta_final[i_shape + 1:i_shape + 1 + n_eps], float)
+        eps_hat = eps_blk if shash == "eps" else float(eps_blk[0])
+        shape_hat = (jnp.asarray(delta_hat), jnp.asarray(eps_hat))
+    tilt_extras = {}
+    if tilt_design is not None:
+        a_hat_t = np.asarray(eta_final[i_tilt:i_tilt + n_tilt], float
+                             ).reshape(n_tilt_rows, -1)
+        # curvature of the data term and of the penalized objective in alpha,
+        # every OTHER parameter held fixed.  These bound the profile curvature
+        # from above -- letting (mu, sigma, a) re-absorb the tilt can only
+        # flatten it -- and their ratio to the profile version measures how much
+        # of the tilt the effect law simply relabels.
+        def _ll_alpha(a, which):
+            e = jnp.asarray(eta_final).at[i_tilt:i_tilt + n_tilt].set(a)
+            f = _data_neg_ll if which == "data" else _neg_obj
+            return f(jnp.asarray(theta), e) / scale
+        a_flat = jnp.asarray(a_hat_t.reshape(-1))
+        tilt_extras = dict(
+            alpha=a_hat_t,
+            alpha_grad_data=np.asarray(
+                jax.grad(_ll_alpha)(a_flat, "data"), float),
+            alpha_hess_data=np.asarray(
+                jax.hessian(_ll_alpha)(a_flat, "data"), float),
+            alpha_hess_pen=np.asarray(
+                jax.hessian(_ll_alpha)(a_flat, "pen"), float),
+            tilt_offset=np.asarray(tilt_off_j, float),
+            tilt_shared=bool(tilt_shared))
     R, P, rates, log_w, phi = spec.unpack(jnp.asarray(theta))
     # K == 1 reports the plain (S, B) tables, so a single-emission fit stays
     # interchangeable with everything written before the mixture existed
     R = np.asarray(R)[0] if K == 1 else np.asarray(R)
     P = np.asarray(P)[0] if K == 1 else np.asarray(P)
     Pi = np.asarray(normal_bin_probs(jnp.asarray(mu_hat), jnp.asarray(sig_hat),
-                                     jnp.asarray(cuts_hat), floor=pi_floor))
+                                     jnp.asarray(cuts_hat), floor=pi_floor,
+                                     shape=shape_hat))
 
     return FitResult(
         R=R, P=P, mu=mu_hat, sigma=sig_hat,
         cuts=cuts_hat, Pi=Pi, rates=np.asarray(rates), log_w=np.asarray(log_w),
         phi=0.0 if conditional else float(phi), loglik=ll, a=a_hat,
-        a_cap=a_cap, n_observed=n_obs, converged=converged, observed=kept,
+        a_cap=a_cap, delta=delta_hat, eps=eps_hat,
+        n_observed=n_obs, converged=converged, observed=kept,
         n_zero_dropped=n_zero_dropped, history=history,
-        extras=({} if not abund_marg else
-                dict(kappa=kappa_hat, abund_cv=kappa_hat ** -0.5)),
+        extras=(dict(tilt_extras) if not abund_marg else
+                dict(kappa=kappa_hat, abund_cv=kappa_hat ** -0.5,
+                     **tilt_extras)),
         config=dict(lambda_fix=lambda_fix, conditional=conditional,
                     abundance=abundance, a_max=a_max,
                     abundance_prior=abundance_prior,
                     n_abund_nodes=n_abund_nodes, kappa=kappa_hat,
                     sigma_prior=sigma_prior, sigma_shared=sigma_shared,
-                    mu_prior=mu_prior, K=K, tau_buckets=tau_buckets,
+                    mu_prior=mu_prior, shash=shash, eps_prior=eps_prior,
+                    K=K, tau_buckets=tau_buckets, sum_mode=sum_mode,
                     pin_median=pin_median, pin_left=pin_left,
-                    pin_weight=pin_weight, pi_floor=pi_floor))
+                    pin_weight=pin_weight, pi_floor=pi_floor,
+                    tilt_prior=tilt_prior, tilt_shared=tilt_shared,
+                    n_tilt=(0 if tilt_design is None else n_tilt)))
 
 
 def fit_effects_adaptive(X, mask=None, *, a_max=20.0, a_max_ceiling=4096.0,
@@ -812,9 +1118,9 @@ def fit_effects_adaptive(X, mask=None, *, a_max=20.0, a_max_ceiling=4096.0,
                          **kw):
     """``fit_effects`` with the abundance bound raised until it stops binding.
 
-    The bound on a_n was underestimated: on some cell lines -- and on
-    essentially all of lib2 -- a percent or more of the sequences sit exactly at
-    ``a_max=15``, which is the model refusing to say how deep they are.  Raising
+    A fixed bound on a_n is easy to underestimate: on some cell lines a
+    percent or more of the sequences sit exactly at it, which is the model
+    refusing to say how deep they are.  Raising
     the bound for everybody is correct and slow, because it is also what sizes
     the latent-count grid.  So the bound is per object and only the objects that
     reach it are raised:
@@ -828,10 +1134,10 @@ def fit_effects_adaptive(X, mask=None, *, a_max=20.0, a_max_ceiling=4096.0,
         bound, or when nothing can be raised any further.
 
     ``bound_frac`` is worth being strict about, because a bound that still
-    binds anywhere moves the whole cell line -- the cuts are shared.  On
-    MDA-MB-231 (lib2), stopping at 0.5% leaves the ceiling at 20 and the
-    activity 0.026 (median) from the a_max=100 fit, barely better than the old
-    a_max=15 default's 0.032; 0.1% escalates to 80 and 0.05% to 160, where the
+    binds anywhere moves the whole cell line -- the cuts are shared.  On a
+    line where the bound bites, stopping at 0.5% leaves the ceiling at 20 and
+    the activity 0.026 (median) from the a_max=100 fit, barely better than a
+    fixed a_max=15's 0.032; 0.1% escalates to 80 and 0.05% to 160, where the
     largest fitted a_n is 98 -- the bound has stopped binding by itself -- and
     the activity is 0.004 from the reference, i.e. at the run-to-run noise
     floor of two fits of the same configuration.  Four warm rounds cost about
@@ -871,6 +1177,10 @@ def fit_effects_adaptive(X, mask=None, *, a_max=20.0, a_max_ceiling=4096.0,
         if res is not None:
             kw = dict(kw, init=init_from_fit(res), a_init=res.a,
                       eta_init=(res.mu, res.sigma))
+            if res.delta is not None:
+                # the shape is part of the effect law, so a round that restarted
+                # it at the Normal would throw away the previous round's fit
+                kw["shape_init"] = (res.delta, res.eps)
         res = fit_effects(X, mask=mask, a_max=ceiling, a_cap=a_cap,
                           cap_headroom=cap_headroom, abundance=True,
                           verbose=verbose, **kw)

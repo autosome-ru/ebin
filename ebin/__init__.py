@@ -10,6 +10,11 @@ Gaussian effect law per sequence; see model.py, effects.py and activity.py.
 
 Set ``K`` above 1 for a K-component NB emission mixture whose component is
 chosen once per sequence for the whole dataset -- see mixture.py.
+
+Two tools sit alongside the fit and are documented in their own modules:
+``qc`` flags defective sequencing libraries from their bin x covariate tilt,
+and ``hier`` shrinks a cell line's covariate response curves toward the panel.
+Both are diagnostics first -- see ``docs/diagnostics.md``.
 """
 
 import os
@@ -28,13 +33,24 @@ from .fit import (fit_effects, fit_effects_adaptive, FitResult,  # noqa: E402,F4
                   save_fits, load_fits, StoredFit, light,
                   abundance_caps, initial_abundance)
 from .activity import posterior_activity  # noqa: E402,F401
+from .freepi import fit_free_pi  # noqa: E402,F401
+from .batch import (poly_basis, sample_tilt, variance_components,  # noqa: E402,F401
+                    shrink_weight, apply_tilt, tilt_factor, tilt_axes)
+from .model import logmarg_window, mode_scale  # noqa: E402,F401
 from .mixture import (fit_mixture, MixtureState, components_table,  # noqa: E402,F401
                       component_summary, component_loglik, relative_depth,
                       ridge_step, penalty_nats, save_state, load_state)
 from .pipeline import (activity_table, mixture_activity_table,  # noqa: E402,F401
-                       readout_table, write_netcdf, cuts_table)
+                       readout_table, write_netcdf, cuts_table,
+                       table_to_netcdf)
+from .qc import (scan_libraries, LibraryScan, library_tilts,  # noqa: E402,F401
+                 fit_failure_mixture, fit_reml, tilt_offsets, drop_defective,
+                 removal_interval)
+from .hier import (replicate_curves, curve_shrinkage,  # noqa: E402,F401
+                   shrink_activity, CurveShrinkage, additive)
 from .plots import (plot_marginal_distribution, plot_activity_vs_raw,  # noqa: E402,F401
                     plot_gc_vs_abundance, plot_components, plot_all,
+                    plot_library_qc, plot_curve_shrinkage,
                     raw_mass_center, gc_content, marginal_density)
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"

@@ -66,6 +66,9 @@ def activity_table(data, groups=None, *, out=None, fits_out=None,
                  which returns the fitted mixture as well.
     fit_kw     : passed to ``fit_effects`` (or, for K > 1, on to
                  ``fit_mixture``: ``em_rounds``, ``mstep_kw``, ``init_gamma``).
+                 ``tilt`` may be a dict {cell line -> (N, B) factor}, as
+                 ``qc.tilt_offsets`` returns, and is then applied per line;
+                 lines absent from it are fitted untilted.
 
     Returns (table, results) where ``table`` has (cell line, field) columns --
     including the per-bin distribution, as ``bin1 ... binB`` -- and ``results``
@@ -91,7 +94,8 @@ def activity_table(data, groups=None, *, out=None, fits_out=None,
         t0 = time.time()
         X, mask, _ = prep(gdata[g])
         init = init_from_fit(warm[g].__dict__) if g in warm else None
-        res = fit_effects(X, mask=mask, init=init, verbose=False, **fit_kw)
+        res = fit_effects(X, mask=mask, init=init, verbose=False,
+                          **_line_kw(fit_kw, g))
         act = posterior_activity(res, X, mask, **(readout or {}))
         fits[g], results[g] = light(res), act
         cols.update(_columns(act, g, fields, index))
@@ -106,6 +110,13 @@ def activity_table(data, groups=None, *, out=None, fits_out=None,
                   f"phi={res.phi:.4f} activity mean={np.nanmean(a):.3f} "
                   f"({time.time()-t0:.0f}s)", flush=True)
     return _write_table(cols, index, out), results
+
+
+def _line_kw(fit_kw, group):
+    """Resolve any per-cell-line keyword (``tilt``) for this line."""
+    if not isinstance(fit_kw.get("tilt"), dict):
+        return fit_kw
+    return {**fit_kw, "tilt": fit_kw["tilt"].get(group)}
 
 
 def mixture_activity_table(data, groups=None, *, out=None, fits_out=None,
@@ -247,6 +258,37 @@ def _write_table(cols, index, out=None):
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         tab.to_csv(out)
     return tab
+
+
+def table_to_netcdf(path, table, attrs=None, order=None):
+    """Write an activity TABLE (what ``activity_table`` returns, or a shrunk one
+    from ``hier.shrink_activity``) to netCDF, laid out like ``write_netcdf``:
+    every scalar field as (cell_type, seq), plus bin_prob if the table carries
+    the bin columns."""
+    import xarray as xr
+
+    lines = list(dict.fromkeys(table.columns.get_level_values(0)))
+    order = [g for g in (order or lines) if g in lines]
+    cols = list(table[order[0]].columns)
+    bins = [c for c in cols if c.startswith("bin") and c[3:].isdigit()]
+    scalars = [c for c in cols if c in FIELD_DESC and c not in WIDE_FIELDS]
+
+    data = {f: (("cell_type", "seq"),
+                np.stack([table[(g, f)].to_numpy(float) for g in order])
+                  .astype(np.float32),
+                {"description": FIELD_DESC[f]}) for f in scalars}
+    coords = {"cell_type": order, "seq": np.asarray(table.index)}
+    if bins:
+        bins = sorted(bins, key=lambda c: int(c[3:]))
+        data["bin_prob"] = (
+            ("cell_type", "seq", "bin"),
+            np.stack([table[g][bins].to_numpy(float) for g in order])
+              .astype(np.float32),
+            {"description": FIELD_DESC["bin_prob"]})
+        coords["bin"] = np.arange(1, len(bins) + 1)
+    ds = xr.Dataset(data, coords=coords, attrs=attrs or {})
+    ds.to_netcdf(path)
+    return ds
 
 
 def write_netcdf(path, results, index, order=None, attrs=None):
