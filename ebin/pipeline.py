@@ -6,7 +6,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from .data import load_groups, prep
+from .data import load_groups, prep, check_bins
 from .fit import fit_effects, StoredFit, light, save_fits, load_fits  # noqa: F401
 from .initialize import init_from_fit
 from .activity import posterior_activity
@@ -86,6 +86,7 @@ def activity_table(data, groups=None, *, out=None, fits_out=None,
     order = [g for g in (groups or gdata) if g in gdata]
     if not order:
         raise ValueError(f"no cell lines to fit (have {sorted(gdata)})")
+    check_bins({g: gdata[g] for g in order})
     warm = load_fits(warm_from) if warm_from else {}
     index = gdata[order[0]].index
 
@@ -136,6 +137,8 @@ def mixture_activity_table(data, groups=None, *, out=None, fits_out=None,
     gdata = data if isinstance(data, dict) else load_groups(data, groups=groups,
                                                             verbose=verbose)
     fields = (MIXTURE_FIELDS if fields is None else fields)
+    check_bins(gdata if groups is None else
+               {g: gdata[g] for g in groups if g in gdata})
     fits, state = fit_mixture(gdata, groups, K=K, warm_from=warm_from,
                               fits_out=fits_out, verbose=verbose, **mix_kw)
 
@@ -213,8 +216,11 @@ def cuts_table(results, out=None):
     at j/B, shared by every sequence of the line.  The gauge pins the first two
     (-1 and 0), so the informative part is where the upper cuts land.
     """
-    tab = pd.DataFrame({g: np.asarray(r["cuts"], float)
-                        for g, r in results.items()}).T
+    cuts = {g: np.asarray(r["cuts"], float) for g, r in results.items()}
+    n = max((len(c) for c in cuts.values()), default=0)
+    # a line with fewer bins has fewer cuts; pad rather than refuse to write
+    tab = pd.DataFrame({g: np.concatenate([c, np.full(n - len(c), np.nan)])
+                        for g, c in cuts.items()}).T
     tab.columns = [f"q{j + 1}" for j in range(tab.shape[1])]
     tab.index.name = "group"
     if out:
@@ -299,13 +305,20 @@ def write_netcdf(path, results, index, order=None, attrs=None):
 
     order = list(order or results)
     first = results[order[0]]
-    B = first["bin_prob"].shape[1]
+    B = max(results[g]["bin_prob"].shape[1] for g in order)
     K = first["comp_prob"].shape[1] if "comp_prob" in first else 1
     # the wide fields get their own dimension below, not the (cell_type, seq) one
     scalars = [f for f in MIXTURE_FIELDS if f in first and f not in WIDE_FIELDS]
     if K == 1:
         scalars = [f for f in scalars if f != "component"]
-    stack = lambda f: np.stack([results[g][f] for g in order])
+    def stack(f):
+        a = [np.asarray(results[g][f], float) for g in order]
+        w = max(x.shape[-1] for x in a) if a[0].ndim > 1 or f == "cuts" else 0
+        if w and any(x.shape[-1] != w for x in a):
+            # ragged B: pad the short lines so the shared axis exists
+            a = [np.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, w - x.shape[-1])],
+                        constant_values=np.nan) for x in a]
+        return np.stack(a)
     data = {"bin_prob": (("cell_type", "seq", "bin"),
                          stack("bin_prob").astype(np.float32),
                          {"description": FIELD_DESC["bin_prob"]}),

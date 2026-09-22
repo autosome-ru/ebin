@@ -59,8 +59,22 @@ __all__ = ["CurveShrinkage", "replicate_curves", "curve_shrinkage",
 
 
 def gc_content(sequences):
+    """GC fraction of each sequence.
+
+    Validated, because a blank or stray row in a hand-edited table otherwise
+    reaches the curve fit as a NaN covariate and surfaces as an unreadable
+    ``SVD did not converge in Linear Least Squares``.
+    """
     s = pd.Index(sequences).astype(str).str.upper()
-    return ((s.str.count("G") + s.str.count("C")) / s.str.len()).to_numpy()
+    n = s.str.len().to_numpy()
+    bad = (n == 0) | (s.str.count("[ACGTN]").to_numpy() != n)
+    if bad.any():
+        show = ", ".join(repr(v[:30]) for v in s[bad][:3])
+        raise ValueError(
+            f"{bad.sum()} of {len(s)} index entries are not DNA sequences "
+            f"({show}): a hand-edited table usually means a blank or shifted "
+            f"row.  Pass sequences= if the index is not the sequence.")
+    return ((s.str.count("G") + s.str.count("C")) / n).to_numpy()
 
 
 # --------------------------------------------------------------------------
@@ -86,6 +100,9 @@ def _smooth_linear(x, y, fit):
     return lambda q: a0 + b * np.asarray(q, float)
 
 
+MIN_FIT_ROWS = 20          # below this a curve is noise, not a curve
+
+
 def additive(y, covs, fit, frac=0.3, rounds=4, method="lowess"):
     """Backfit ``y ~ sum_k f_k(cov_k)``; returns the fitted 1-D curves.
 
@@ -94,6 +111,14 @@ def additive(y, covs, fit, frac=0.3, rounds=4, method="lowess"):
     decomposition to a multiple regression -- useful as a control on how much
     of a curve is just a slope.
     """
+    fit = np.asarray(fit, bool)
+    if fit.sum() < MIN_FIT_ROWS:
+        raise ValueError(f"only {int(fit.sum())} usable rows, need at least "
+                         f"{MIN_FIT_ROWS}: nothing here defines a curve")
+    for k, x in enumerate(covs):
+        if not np.isfinite(np.asarray(x, float)[fit]).all():
+            raise ValueError(f"covariate {k} is not finite on all "
+                             f"{int(fit.sum())} fitted rows")
     f = [np.zeros(len(y)) for _ in covs]
     fun = [None] * len(covs)
     for _ in range(rounds):
@@ -144,7 +169,13 @@ def replicate_curves(counts, sequences=None, *, n_grid=41, frac=0.3,
         b_names = list(dict.fromkeys(sub.columns))
         X = sub[[b_names[i] for i in bin_order(b_names)]].to_numpy(float)
         tot = X.sum(1)
-        ok = tot >= min_reads
+        ok = (tot >= min_reads) & np.isfinite(gc)
+        if ok.sum() < MIN_FIT_ROWS:
+            raise ValueError(
+                f"library {line}/{rep}: only {int(ok.sum())} sequences reach "
+                f"min_reads={min_reads}, so it carries no curve.  Lower "
+                f"min_reads, or take that library out of the table "
+                f"(--groups excludes a whole cell line)")
         ebin = np.full(len(tot), np.nan)
         ebin[ok] = (X[ok] @ np.arange(1, X.shape[1] + 1)) / tot[ok]
         z = _standardize(ebin, ok)
@@ -241,9 +272,14 @@ class CurveShrinkage:
                 f"  {term:<6} pairs {len(c['pairs']):2d} "
                 f"({', '.join(dict.fromkeys(p.split('[')[0] for p in c['pairs']))})   "
                 f"sigma_tech {np.sqrt(c['s2_tech']).mean():.4f}  "
-                f"sigma_bio {np.sqrt(c['s2_bio']).mean():.4f}  "
+                f"sigma_bio {np.sqrt(c['s2_bio']).mean():.4f} "
+                f"over {len(c['lines'])} lines  "
                 f"noise {c['s2_noise'].sum() / c['s2_raw'].sum():5.1%} of the "
                 f"raw difference   w(S=1) {w.mean():.3f}")
+        n = len(self.gc["lines"])
+        if n < 5:
+            out.append(f"  CAUTION: sigma_bio is a variance over {n} cell "
+                       f"lines, so the weight is barely determined")
         return "\n".join(out)
 
 
@@ -298,6 +334,12 @@ def shrink_activity(table, shrinkage, counts=None, *, sequences=None,
     correction.  ``loo=True`` leaves each line out of its own panel mean.
     """
     lines = [c for c in dict.fromkeys(table.columns.get_level_values(0))]
+    if len(lines) < 2:
+        raise ValueError(
+            f"the activity table has {len(lines)} cell line(s): a line is "
+            f"shrunk toward the mean of the OTHER lines, so with one column "
+            f"there is nothing to shrink toward and the call would be a silent "
+            f"no-op.  Shrink the whole panel, then take the column you want")
     seqs = table.index.to_numpy() if sequences is None else np.asarray(sequences)
     gc = gc_content(seqs)
     dep = _depth_frame(table, counts, depth, lines)
@@ -363,5 +405,14 @@ def _depth_frame(table, counts, depth, lines):
                          "covariate")
     df = counts if isinstance(counts, pd.DataFrame) else read_counts(counts)
     df = df.fillna(0.0)
-    return pd.DataFrame({c: df[c].to_numpy(float).sum(1) for c in lines},
-                        index=df.index).reindex(table.index)
+    missing = [c for c in lines if c not in df.columns.get_level_values(0)]
+    if missing:
+        raise ValueError(
+            f"the activity table has cell line(s) {missing} that the count "
+            f"table does not.  Pass the counts the table was fitted from")
+    dep = pd.DataFrame({c: df[c].to_numpy(float).sum(1) for c in lines},
+                       index=df.index).reindex(table.index)
+    if not np.isfinite(dep.to_numpy(float)).any():
+        raise ValueError("no sequence of the activity table is in the count "
+                         "table: the two indexes do not match")
+    return dep

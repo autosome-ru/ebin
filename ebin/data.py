@@ -33,6 +33,14 @@ def read_counts(path, sep=None):
     return pd.read_csv(path, sep=sep, index_col=0, header=[0, 1, 2])
 
 
+def cell_lines(path, sep=None):
+    """The cell lines of a count table, in file order, without reading the data."""
+    if sep is None:
+        sep = "\t" if str(path).endswith((".tsv", ".txt")) else ","
+    head = pd.read_csv(path, sep=sep, index_col=0, header=[0, 1, 2], nrows=0)
+    return list(dict.fromkeys(head.columns.get_level_values(0)))
+
+
 def load_groups(path_or_df, groups=None, verbose=False):
     """Split the count table into per-cell-line (N, S, B) tensors.
 
@@ -72,6 +80,25 @@ def load_groups(path_or_df, groups=None, verbose=False):
         out[g] = GroupData(name=g, X=X, mask=~np.isnan(X), index=sub.index,
                            s_names=s_names, b_names=b_names)
     return out
+
+
+def check_bins(gdata):
+    """Warn if the cell lines do not share a number of bins, and return the map.
+
+    Every panel-level output -- the cut points, the netCDF, any comparison of
+    one line's activity with another's -- assumes one B.  A line with a bin
+    column missing is otherwise only discovered when those outputs are
+    assembled, which is after the whole fit.
+    """
+    bins = {g: len(gd.b_names) for g, gd in gdata.items()}
+    if len(set(bins.values())) > 1:
+        wide = ", ".join(f"{g} ({b} bins)" for g, b in bins.items())
+        print(f"[data] WARNING: the cell lines do not share a number of "
+              f"bins: {wide}.\n[data] E[bin] runs over 1..B, so those "
+              f"activities are NOT on the same scale.  If that is not "
+              f"deliberate, a bin column is missing from the table.",
+              flush=True)
+    return bins
 
 
 def bin_order(b_names):

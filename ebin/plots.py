@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .data import load_groups, prep
+from .hier import gc_content  # noqa: F401  (re-exported)
 
 
 def _plt():
@@ -100,16 +101,6 @@ def raw_mass_center(counts, groups=None):
         out[g] = np.where(s > 0, (y * b).sum(1) / np.maximum(s, 1e-30), np.nan)
         index = gd.index
     return pd.DataFrame(out, index=index)
-
-
-def gc_content(sequences):
-    """GC fraction of each sequence."""
-    s = pd.Index(sequences).astype(str).str.upper()
-    letters = s.str.count("[ACGTN]").to_numpy()
-    if not np.all(letters == s.str.len().to_numpy()):
-        raise ValueError("sequences must be DNA strings; pass sequences= "
-                         "explicitly if the table index is not the sequence")
-    return ((s.str.count("G") + s.str.count("C")) / s.str.len()).to_numpy()
 
 
 def marginal_density(mu, sigma, x, weights=None, chunk=4096):
@@ -419,19 +410,36 @@ def plot_curve_shrinkage(curves, shrinkage, out=None, term="gc"):
 
 
 def plot_all(table, counts, outdir=".", groups=None, state=None, scan=None,
-             curves=None, shrinkage=None):
-    """Write the diagnostics into ``outdir``."""
+             curves=None, shrinkage=None, strict=True):
+    """Write the diagnostics into ``outdir``.
+
+    ``strict=False`` reports a figure that fails and draws the rest, which is
+    what the CLI uses: a broken diagnostic must not discard a fit that took
+    hours.
+    """
     import os
     os.makedirs(outdir, exist_ok=True)
     p = lambda n: os.path.join(outdir, n)
-    plot_marginal_distribution(table, groups, out=p("marginal_effect_law.png"))
-    plot_activity_vs_raw(table, counts, groups, out=p("activity_vs_raw.png"))
-    plot_gc_vs_abundance(table, groups=groups, out=p("gc_vs_abundance.png"))
+
+    def draw(fn, *args, **kw):
+        if strict:
+            return fn(*args, **kw)
+        try:
+            return fn(*args, **kw)
+        except Exception as e:
+            print(f"[plot] {fn.__name__} failed: {type(e).__name__}: {e}")
+
+    draw(plot_marginal_distribution, table, groups,
+         out=p("marginal_effect_law.png"))
+    draw(plot_activity_vs_raw, table, counts, groups,
+         out=p("activity_vs_raw.png"))
+    draw(plot_gc_vs_abundance, table, groups=groups,
+         out=p("gc_vs_abundance.png"))
     if state is not None and state.K > 1:
-        plot_components(state, counts, groups, out=p("components.png"))
+        draw(plot_components, state, counts, groups, out=p("components.png"))
     if scan is not None:
-        plot_library_qc(scan, out=p("library_qc.png"))
+        draw(plot_library_qc, scan, out=p("library_qc.png"))
     if curves is not None and shrinkage is not None:
         for term in ("gc", "depth"):
-            plot_curve_shrinkage(curves, shrinkage, term=term,
-                                 out=p(f"curve_shrinkage_{term}.png"))
+            draw(plot_curve_shrinkage, curves, shrinkage, term=term,
+                 out=p(f"curve_shrinkage_{term}.png"))

@@ -1,8 +1,9 @@
 """Command line.
 
-    ebin fit  counts.csv -o activity.csv     fit and write the activity table
-    ebin qc   counts.csv -o qc/              flag defective libraries
-    ebin hier counts.csv -a activity.csv     shrink the per-line curves
+    ebin fit   counts.csv -o activity.csv        fit, write the activity table
+    ebin qc    counts.csv -o qc/                 flag defective libraries
+    ebin hier  counts.csv -a activity.csv        shrink the per-line curves
+    ebin plots activity.csv counts.csv -o p/     redraw the fit diagnostics
 
 ``ebin counts.csv`` with no subcommand is ``ebin fit``.
 """
@@ -18,6 +19,9 @@ def _add_fit_options(p):
     p.add_argument("-o", "--out", default="activity.csv", help="output CSV")
     p.add_argument("--groups", help="comma-separated cell lines to run, in "
                                     "output order (default: all)")
+    p.add_argument("--exclude",
+                   help="comma-separated cell lines to leave out.  Use this "
+                        "instead of editing the count table by hand")
     p.add_argument("--zero-truncation", action="store_true",
                    help="drop all-zero rows instead of fitting them as "
                         "structural zeros")
@@ -83,6 +87,11 @@ def _add_fit_options(p):
                    help="instead of dropping them, divide the estimated "
                         "technical tilt out of the flagged LINES' profiles.  "
                         "Mutually exclusive with --drop-defective")
+    p.add_argument("--keep-lines",
+                   help="comma-separated cell lines whose flagged libraries "
+                        "--drop-defective must keep.  This is how you act on "
+                        "the scan for the rest of the panel while holding on "
+                        "to a line you need -- no hand-editing of the CSV")
     p.add_argument("--defect-threshold", type=float, default=0.3,
                    help="P(defective) above which a library is flagged")
     p.add_argument("-q", "--quiet", action="store_true")
@@ -102,6 +111,7 @@ def _parse_args(argv):
     q.add_argument("-o", "--out", default="qc",
                    help="directory for the scan table and figure")
     q.add_argument("--groups", help="comma-separated cell lines to scan")
+    q.add_argument("--exclude", help="comma-separated cell lines to leave out")
     q.add_argument("--degree", type=int, default=2,
                    help="polynomial degree of the GC basis")
     q.add_argument("--min-reads", type=int, default=20,
@@ -113,6 +123,14 @@ def _parse_args(argv):
                         "on the removal fraction (0 = skip; 300 is plenty)")
     q.add_argument("--no-plot", action="store_true")
 
+    pl = sub.add_parser("plots", help="redraw the fit diagnostics from a "
+                                      "written activity table")
+    pl.add_argument("activity", help="activity CSV written by ebin fit")
+    pl.add_argument("data", help="the count table it was fitted from")
+    pl.add_argument("-o", "--out", default="plots")
+    pl.add_argument("--groups")
+    pl.add_argument("--exclude", help="comma-separated cell lines to leave out")
+
     h = sub.add_parser("hier", help="shrink per-line covariate response curves")
     h.add_argument("data")
     h.add_argument("-a", "--activity",
@@ -121,6 +139,7 @@ def _parse_args(argv):
     h.add_argument("-o", "--out", default="hier",
                    help="directory for the report and figures")
     h.add_argument("--groups")
+    h.add_argument("--exclude", help="comma-separated cell lines to leave out")
     h.add_argument("--smoother", choices=("lowess", "linear"), default="lowess",
                    help="'linear' makes every curve a straight line, which is "
                         "the control on how much of a curve is just a slope")
@@ -144,13 +163,31 @@ def _parse_args(argv):
                                     "(needs -a)")
     h.add_argument("--no-plot", action="store_true")
 
-    if argv and argv[0] not in {"fit", "qc", "hier", "-h", "--help"}:
+    if argv and argv[0] not in {"fit", "qc", "hier", "plots", "-h", "--help"}:
         argv = ["fit"] + list(argv)          # bare `ebin counts.csv`
     a = p.parse_args(argv)
     if a.cmd is None:
         p.print_help()
         raise SystemExit(2)
     return a
+
+
+def _group_list(a):
+    """--groups / --exclude resolved against the table's own header."""
+    groups = a.groups.split(",") if a.groups else None
+    excl = a.exclude.split(",") if getattr(a, "exclude", None) else []
+    if not excl:
+        return groups
+    from .data import cell_lines
+    have = groups or cell_lines(a.data)
+    unknown = [g for g in excl if g not in have]
+    if unknown:
+        raise SystemExit(f"--exclude: no such cell line {unknown}; the table "
+                         f"has {have}")
+    out = [g for g in have if g not in set(excl)]
+    if not out:
+        raise SystemExit("--exclude leaves no cell line to run")
+    return out
 
 
 def _fit_kwargs(a):
@@ -180,7 +217,10 @@ def cmd_fit(a):
     if a.drop_defective and a.correct_defective:
         raise SystemExit("--drop-defective and --correct-defective are "
                          "mutually exclusive")
-    groups = a.groups.split(",") if a.groups else None
+    if a.keep_lines and not (a.drop_defective or a.correct_defective):
+        raise SystemExit("--keep-lines only means something with "
+                         "--drop-defective or --correct-defective")
+    groups = _group_list(a)
     data, fit_kw = a.data, _fit_kwargs(a)
     if a.drop_defective or a.correct_defective:
         from .qc import scan_libraries, drop_defective, tilt_offsets
@@ -190,25 +230,42 @@ def cmd_fit(a):
         data = read_counts(a.data)
         scan = scan_libraries(data, threshold=a.defect_threshold,
                               verbose=not a.quiet)
+        keep = a.keep_lines.split(",") if a.keep_lines else ()
+        unknown = [g for g in keep
+                   if g not in set(data.columns.get_level_values(0))]
+        if unknown:
+            raise SystemExit(f"--keep-lines: no such cell line {unknown}")
         if not scan.defective:
             print("[qc] nothing flagged; fitting the table as given")
         elif a.drop_defective:
-            data, dropped = drop_defective(data, scan)
-            print("[qc] dropped " + ", ".join(f"{l}/{r}" for l, r in dropped))
+            before = list(dict.fromkeys(data.columns.get_level_values(0)))
+            data, dropped = drop_defective(data, scan, keep_lines=keep)
+            if not dropped:
+                print("[qc] every flagged library is kept by --keep-lines")
+            else:
+                print("[qc] dropped "
+                      + ", ".join(f"{l}/{r}" for l, r in dropped))
             left = set(data.columns.get_level_values(0))
+            vanished = [g for g in before if g not in left]
+            if vanished:
+                print(f"[qc] {', '.join(vanished)} had no library left and is "
+                      f"gone from the output; --keep-lines {vanished[0]} or "
+                      f"--correct-defective keeps it")
             gone = [g for g in (groups or ()) if g not in left]
             if gone:
-                print(f"[qc] {', '.join(gone)} had no library left and is not "
-                      f"fitted; --correct-defective keeps it")
                 groups = [g for g in groups if g in left]
                 if not groups:
                     raise SystemExit(
                         "every cell line you asked for lost its only library; "
-                        "use --correct-defective, or --groups with a line that "
-                        "survives")
+                        "use --keep-lines or --correct-defective")
         else:
-            fit_kw["tilt"] = tilt_offsets(scan, lines=scan.defective_lines)
-            print("[qc] correcting " + ", ".join(fit_kw["tilt"]))
+            lines = [l for l in scan.defective_lines if l not in set(keep)]
+            if not lines:
+                print("[qc] every flagged line is kept by --keep-lines; "
+                      "fitting the table as given")
+            else:
+                fit_kw["tilt"] = tilt_offsets(scan, lines=lines)
+                print("[qc] correcting " + ", ".join(fit_kw["tilt"]))
 
     n_mu, n_ls = (int(v) for v in a.grid.lower().split("x"))
     common = dict(groups=groups, out=a.out, fits_out=a.save_fits,
@@ -237,14 +294,15 @@ def cmd_fit(a):
         print(f"[saved] {a.netcdf}")
     if a.plots:
         from .plots import plot_all
-        plot_all(table, data, a.plots, groups=list(results), state=state)
+        plot_all(table, data, a.plots, groups=list(results), state=state,
+                 strict=False)
 
 
 def cmd_qc(a):
     from .qc import scan_libraries, removal_interval
     os.makedirs(a.out, exist_ok=True)
-    scan = scan_libraries(a.data, groups=a.groups.split(",") if a.groups
-                          else None, degree=a.degree, min_reads=a.min_reads,
+    scan = scan_libraries(a.data, groups=_group_list(a),
+                          degree=a.degree, min_reads=a.min_reads,
                           threshold=a.defect_threshold, verbose=True)
     path = os.path.join(a.out, "library_scan.csv")
     scan.table.to_csv(path, index=False)
@@ -261,12 +319,21 @@ def cmd_qc(a):
         plot_library_qc(scan, out=os.path.join(a.out, "library_qc.png"))
 
 
+def cmd_plots(a):
+    import pandas as pd
+    from .plots import plot_all
+    table = pd.read_csv(a.activity, index_col=0, header=[0, 1])
+    lines = _group_list(a) or list(
+        dict.fromkeys(table.columns.get_level_values(0)))
+    plot_all(table, a.data, a.out, groups=lines, strict=False)
+
+
 def cmd_hier(a):
     import pandas as pd
     from .hier import replicate_curves, curve_shrinkage, shrink_activity
     from .qc import scan_libraries
     os.makedirs(a.out, exist_ok=True)
-    groups = a.groups.split(",") if a.groups else None
+    groups = _group_list(a)
 
     scan = None
     if a.exclude_defective:
@@ -278,6 +345,9 @@ def cmd_hier(a):
     sh = curve_shrinkage(curves, scan=scan, scale=a.scale,
                          drop=a.drop_lines.split(",") if a.drop_lines else ())
     print("\n" + sh.summary())
+    print("  sigma_bio is a between-cell-line variance and the target is the "
+          "panel mean,\n  so both the weight and the output change if the "
+          "panel changes")
 
     if a.activity:
         table = pd.read_csv(a.activity, index_col=0, header=[0, 1])
@@ -295,6 +365,9 @@ def cmd_hier(a):
                 arm=f"hier_{a.smoother}", smoother=a.smoother,
                 shrinkage_terms=a.terms, shrinkage_scale=str(a.scale),
                 excluded_from_variance=", ".join(sh.dropped) or "none",
+                weight_gc=f"{report.w_gc.mean():.4f}",
+                weight_depth=f"{report.w_depth.mean():.4f}",
+                panel=", ".join(report.line.sort_values()),
                 source=os.path.basename(a.activity)))
             print(f"[saved] {a.netcdf}")
     elif a.netcdf:
@@ -309,7 +382,8 @@ def cmd_hier(a):
 
 def main(argv=None):
     a = _parse_args(sys.argv[1:] if argv is None else list(argv))
-    {"fit": cmd_fit, "qc": cmd_qc, "hier": cmd_hier}[a.cmd](a)
+    {"fit": cmd_fit, "qc": cmd_qc, "hier": cmd_hier,
+     "plots": cmd_plots}[a.cmd](a)
 
 
 if __name__ == "__main__":

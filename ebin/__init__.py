@@ -53,4 +53,4 @@ from .plots import (plot_marginal_distribution, plot_activity_vs_raw,  # noqa: E
                     plot_library_qc, plot_curve_shrinkage,
                     raw_mass_center, gc_content, marginal_density)
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
